@@ -1,0 +1,5 @@
+# Только для тестов. В продакшн-образ не ставится — requirements.txt не менялся.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-aiohttp>=1.0

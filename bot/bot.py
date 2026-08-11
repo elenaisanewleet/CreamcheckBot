@@ -1,22 +1,28 @@
 """
 ComedoBot — Telegram bot (aiogram 3) — FINAL BALANCED VERSION
 
-Логика:
+Логика (не менялась):
 - Шаг 1: краткий результат (риск + контекст) + 2 кнопки
 - Кнопка 1: "Посмотреть состав" → полный список ингредиентов
 - Кнопка 2: "Подробнее" → пояснение + рекомендации
+
+Что добавлено в оптимизации:
+- аналитика: кто, когда и чем пользуется (SQLite + /stats + веб-дашборд)
+- кэш готовых разборов: повтор популярного продукта отвечает мгновенно и бесплатно
+- проверка ссылки-источника убрана с «горячего» пути — ответ приходит быстрее
+- альбом из нескольких фото уходит в модель ОДНИМ запросом
+- один тяжёлый анализ на пользователя одновременно
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import secrets
 import time
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import os
-from aiohttp import web
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -29,38 +35,14 @@ from aiogram.types import (
     PhotoSize,
 )
 
+from . import admin, analytics, config, dashboard
 from .config import TELEGRAM_BOT_TOKEN
-from agent.agent import run_agent_step1, run_agent_step2
+from agent.agent import run_agent_step1_ex, run_agent_step2_ex, build_step2_payload
 from agent.comedogen_base import hard_comedogens, conditional_comedogens
 
 
-logging.basicConfig(level=logging.INFO)
-
-# ─────────────────────────────────────────────────────────────
-# Render health server
-# ─────────────────────────────────────────────────────────────
-
-RENDER_PORT = int(os.getenv("PORT", "10000"))
-
-
-async def _health_app() -> web.Application:
-    app = web.Application()
-
-    async def health(request: web.Request) -> web.Response:
-        return web.Response(text="ok")
-
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    return app
-
-
-async def _run_health_server() -> None:
-    app = await _health_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=RENDER_PORT)
-    await site.start()
-    logging.info("Health server started on port %s", RENDER_PORT)
+analytics.setup_logging()
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -140,9 +122,9 @@ CreamcheckBot помогает ориентироваться в составе 
 
 <b>Что это НЕ</b>
 
-• Не медицинская консультация  
-• Не диагностика состояния кожи  
-• Не гарантия реакции или её отсутствия  
+• Не медицинская консультация
+• Не диагностика состояния кожи
+• Не гарантия реакции или её отсутствия
 • Не повод отменять назначенное лечение
 
 {DIVIDER_LIGHT}
@@ -180,6 +162,8 @@ PROCESSING_TEXT = "🫧 Ищу состав…"
 PROCESSING_STEP2 = "🫧 Готовлю подробное пояснение…"
 ERROR_GENERAL = "Не удалось обработать запрос. Попробуй ещё раз или отправь другое фото."
 ERROR_EMPTY = "Отправь фото средства или напиши его название."
+BUSY_MESSAGE = "🫧 Ещё разбираю предыдущий запрос — отвечу через несколько секунд."
+TOO_LONG_MESSAGE = "Напиши покороче: бренд и название продукта — этого достаточно 🤍"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -216,14 +200,52 @@ BASE_MESSAGE = _build_base_message()
 # Вспомогательное
 # ─────────────────────────────────────────────────────────────
 
+# Один HTTP-клиент на весь процесс: соединения переиспользуются,
+# не тратим время на TLS-хендшейк для каждой картинки.
+_http: Optional[httpx.AsyncClient] = None
+
+
+def _http_client() -> httpx.AsyncClient:
+    global _http
+    if _http is None or _http.is_closed:
+        _http = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
+    return _http
+
+
 async def _download_photo(bot: Bot, photo: PhotoSize) -> bytes:
     file = await bot.get_file(photo.file_id)
     url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+    resp = await _http_client().get(url)
+    resp.raise_for_status()
+    return resp.content
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.content
+
+def _maybe_shrink(image: bytes) -> bytes:
+    """Опциональное сжатие фото (IMAGE_MAX_SIDE). По умолчанию выключено:
+    мелкий шрифт состава лучше распознаётся в оригинальном разрешении."""
+    if config.IMAGE_MAX_SIDE <= 0:
+        return image
+    try:
+        from io import BytesIO
+
+        from PIL import Image  # type: ignore
+
+        img = Image.open(BytesIO(image))
+        if max(img.size) <= config.IMAGE_MAX_SIDE:
+            return image
+        img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE), Image.LANCZOS)
+        out = BytesIO()
+        img.convert("RGB").save(out, format="JPEG", quality=config.IMAGE_JPEG_QUALITY, optimize=True)
+        shrunk = out.getvalue()
+        logger.info("Фото сжато: %d → %d байт", len(image), len(shrunk))
+        return shrunk if shrunk else image
+    except Exception as exc:  # noqa: BLE001 — Pillow может отсутствовать
+        logger.debug("Сжатие фото пропущено: %s", exc)
+        return image
 
 
 RISK_LABELS = {
@@ -294,17 +316,20 @@ async def _validate_source_url(url: str, ingredients: List[Dict[str, Any]]) -> b
         if name and len(name) >= 4:
             sample_names.append(name)
 
-    if len(sample_names) < 3:
-        # если ингредиентов мало/непонятно, не блокируем ссылку излишне строго
-        sample_names = [n for n in sample_names if n]
+    if not sample_names:
+        return False
+
+    # если ингредиентов мало — не блокируем ссылку излишне строго
+    needed = min(3, len(sample_names))
 
     try:
         timeout = httpx.Timeout(6.0, connect=5.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                return False
-            text = _norm_text_for_match(resp.text)
+        resp = await _http_client().get(
+            url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout
+        )
+        if resp.status_code != 200:
+            return False
+        text = _norm_text_for_match(resp.text)
 
         # считаем попадания по подстроке (не идеально, но достаточно, чтобы отсеять "не туда")
         hits = 0
@@ -312,7 +337,7 @@ async def _validate_source_url(url: str, ingredients: List[Dict[str, Any]]) -> b
             nn = _norm_text_for_match(n)
             if nn and nn in text:
                 hits += 1
-            if hits >= 3:
+            if hits >= needed:
                 return True
 
         # если совсем не нашли совпадений — вероятно это не страница состава
@@ -320,6 +345,34 @@ async def _validate_source_url(url: str, ingredients: List[Dict[str, Any]]) -> b
 
     except Exception:
         return False
+
+
+async def _source_url_ok(url: str, ingredients: List[Dict[str, Any]]) -> bool:
+    """Та же проверка, но с кэшем: одну и ту же страницу не дёргаем повторно."""
+    cached = await analytics.url_check_get(url)
+    if cached is not None:
+        return cached
+    ok = await _validate_source_url(url, ingredients)
+    await analytics.url_check_put(url, ok)
+    return ok
+
+
+def _warm_source_url(url: Optional[str], ingredients: List[Dict[str, Any]]) -> None:
+    """Прогреваем проверку ссылки в фоне — чтобы к нажатию «Состав» она была готова.
+
+    Раньше эта проверка выполнялась ДО ответа пользователю и добавляла к каждому
+    разбору до 6 секунд ожидания. Теперь ответ уходит сразу.
+    """
+    if not url or not ingredients:
+        return
+
+    async def _job() -> None:
+        try:
+            await _source_url_ok(url, ingredients)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Прогрев проверки ссылки не удался: %s", exc)
+
+    asyncio.create_task(_job())
 
 
 def calc_risk_level_strict(ingredients: List[Dict[str, Any]]) -> str:
@@ -372,6 +425,20 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
 def _cache_del(token: str) -> None:
     STEP2_CACHE.pop(token, None)
     STEP2_INFLIGHT.pop(token, None)
+
+
+def _sweep_memory_caches() -> None:
+    """Чистит протухшие токены — иначе словарь растёт бесконечно."""
+    now = time.time()
+    stale = [t for t, item in STEP2_CACHE.items()
+             if now - float(item.get("ts", 0)) > STEP2_CACHE_TTL_SEC]
+    for t in stale:
+        STEP2_CACHE.pop(t, None)
+        STEP2_INFLIGHT.pop(t, None)
+    for t in [t for t, ts in STEP2_INFLIGHT.items() if now - ts > 600]:
+        STEP2_INFLIGHT.pop(t, None)
+    if stale:
+        logger.debug("Очищено %d просроченных токенов", len(stale))
 
 
 def _parse_agent_json(raw: str) -> Optional[Dict[str, Any]]:
@@ -633,89 +700,385 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
 
 
 # ─────────────────────────────────────────────────────────────
+# Кэш готовых разборов (SQLite): скорость + экономия на API
+# ─────────────────────────────────────────────────────────────
+
+_PUNCT = re.compile(r"[^\w\s\-\+/&.]", flags=re.UNICODE)
+
+
+def normalize_product_key(name: str) -> str:
+    """Нормализуем название для ключа кэша: регистр, пробелы, пунктуация."""
+    s = (name or "").strip().lower()
+    s = _PUNCT.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def step1_cache_key_text(name: str) -> str:
+    return "s1:name:" + normalize_product_key(name)
+
+
+def step1_cache_key_images(images: Sequence[bytes], caption: Optional[str] = None) -> str:
+    h = hashlib.sha256()
+    for img in images:
+        h.update(hashlib.sha256(img).digest())
+    if caption:
+        h.update(normalize_product_key(caption).encode("utf-8"))
+    return "s1:img:" + h.hexdigest()[:32]
+
+
+def step2_cache_key(step1_data: Dict[str, Any]) -> str:
+    payload = build_step2_payload(step1_data)
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "s2:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+# ─────────────────────────────────────────────────────────────
+# Ограничение параллельных разборов
+# ─────────────────────────────────────────────────────────────
+
+_ACTIVE_USERS: Dict[int, float] = {}
+_USER_HISTORY: Dict[int, List[float]] = {}
+
+
+def _try_acquire(user_id: Optional[int]) -> Tuple[bool, str]:
+    """Возвращает (можно ли начать, причина отказа)."""
+    if not user_id:
+        return True, ""
+
+    now = time.time()
+
+    if config.SINGLE_FLIGHT_PER_USER:
+        started = _ACTIVE_USERS.get(user_id)
+        # 5 минут — предохранитель на случай зависшей задачи
+        if started and now - started < 300:
+            return False, "busy"
+
+    if config.RATE_LIMIT_PER_HOUR > 0:
+        hist = [t for t in _USER_HISTORY.get(user_id, []) if now - t < 3600]
+        if len(hist) >= config.RATE_LIMIT_PER_HOUR:
+            _USER_HISTORY[user_id] = hist
+            return False, "rate_limit"
+        hist.append(now)
+        _USER_HISTORY[user_id] = hist
+
+    _ACTIVE_USERS[user_id] = now
+    return True, ""
+
+
+def _release(user_id: Optional[int]) -> None:
+    if user_id:
+        _ACTIVE_USERS.pop(user_id, None)
+
+
+# ─────────────────────────────────────────────────────────────
 # Handlers
 # ─────────────────────────────────────────────────────────────
 
 async def handle_start(msg: Message):
     await msg.answer(f"{START_MESSAGE}\n\n{build_doctor_cta_footer()}")
+    await analytics.track(kind="start", user=msg.from_user, chat_id=msg.chat.id)
 
 
 async def handle_help(msg: Message):
     await msg.answer(f"{HELP_MESSAGE}\n\n{build_doctor_cta_footer()}")
+    await analytics.track(kind="help", user=msg.from_user, chat_id=msg.chat.id)
 
 
 async def handle_about(msg: Message):
     await msg.answer(f"{ABOUT_MESSAGE}\n\n{build_doctor_cta_footer()}")
+    await analytics.track(kind="about", user=msg.from_user, chat_id=msg.chat.id)
 
 
 async def handle_contacts(msg: Message):
     await msg.answer(f"{CONTACTS_MESSAGE}\n\n{build_doctor_cta_footer()}")
+    await analytics.track(kind="contacts", user=msg.from_user, chat_id=msg.chat.id)
 
 
 async def handle_base(msg: Message):
     await msg.answer(BASE_MESSAGE)
+    await analytics.track(kind="base", user=msg.from_user, chat_id=msg.chat.id)
 
 
-async def _run_step1_and_answer(msg: Message, bot: Bot, product_name: Optional[str], image_bytes: Optional[bytes]):
-    status = await msg.answer(PROCESSING_PHOTO if image_bytes else PROCESSING_TEXT)
-    try:
-        raw = await run_agent_step1(product_name=product_name, image_bytes=image_bytes)
-        data = _parse_agent_json(raw)
-        if not data:
+async def _answer_from_step1(
+    msg: Message,
+    data: Dict[str, Any],
+    *,
+    status: Optional[Message] = None,
+) -> None:
+    """Отправляет краткий результат шага 1 и вешает кнопки."""
+    answer = build_step1_brief_message(data)
+    ingredients = data.get("ingredients") or []
+
+    reply_markup: Optional[InlineKeyboardMarkup] = None
+    if data.get("error") != "no_inci" and ingredients:
+        token = _cache_put(
+            {
+                "product_name": data.get("product_name"),
+                "risk_level": data.get("risk_level"),
+                "source_url": data.get("source_url"),
+                "ingredients": ingredients,
+            }
+        )
+        reply_markup = _build_step1_keyboard(token)
+
+    if status is not None:
+        try:
             await status.delete()
-            return await msg.answer(ERROR_GENERAL)
+        except Exception:  # noqa: BLE001
+            pass
+
+    await msg.answer(answer, reply_markup=reply_markup)
+
+
+async def _run_step1_and_answer(
+    msg: Message,
+    bot: Bot,
+    product_name: Optional[str],
+    images: Optional[Sequence[bytes]] = None,
+    *,
+    status: Optional[Message] = None,
+    source: str = "text",
+    started_at: Optional[float] = None,
+):
+    images = list(images or [])
+    user = msg.from_user
+    user_id = getattr(user, "id", None)
+    t0 = started_at or time.monotonic()
+
+    if status is None:
+        status = await msg.answer(PROCESSING_PHOTO if images else PROCESSING_TEXT)
+
+    async def _drop_status() -> None:
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        # ── 1. Кэш: тот же продукт уже разбирали недавно?
+        cache_key = (
+            step1_cache_key_images(images, product_name)
+            if images
+            else step1_cache_key_text(product_name or "")
+        )
+        cached = await analytics.cache_get(cache_key)
+        if cached:
+            logger.info("Кэш-попадание: %s", cache_key)
+            await _answer_from_step1(msg, cached, status=status)
+            _warm_source_url(cached.get("source_url"), cached.get("ingredients") or [])
+            await analytics.track(
+                kind=source,
+                user=user,
+                chat_id=msg.chat.id,
+                status="ok",
+                source=source,
+                product=cached.get("product_name"),
+                risk=cached.get("risk_level"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                cached=True,
+            )
+            return
+
+        result = await run_agent_step1_ex(product_name=product_name, images=images)
+        data = _parse_agent_json(result.raw)
+        usage = result.usage
+
+        if not data:
+            await _drop_status()
+            await msg.answer(ERROR_GENERAL)
+            await analytics.track(
+                kind=source, user=user, chat_id=msg.chat.id, status="error", source=source,
+                product=product_name, latency_ms=int((time.monotonic() - t0) * 1000),
+                model=usage.model, in_tokens=usage.in_tokens, cached_tokens=usage.cached_tokens,
+                out_tokens=usage.out_tokens, tool_calls=usage.tool_calls,
+                detail="модель вернула не-JSON",
+            )
+            return
 
         ingredients = data.get("ingredients") or []
         if ingredients and data.get("error") != "no_inci":
             data["risk_level"] = calc_risk_level_strict(ingredients)
 
-        # ── Нормализуем и валидируем source_url (чтобы не показывать "битые" ссылки)
+        # ── Нормализуем source_url. Проверку доступности НЕ ждём:
+        #    она уходит в фон и понадобится только на экране «Состав».
         if data.get("error") != "no_inci":
-            su = _normalize_source_url(data.get("source_url"))
-            if su and ingredients:
-                ok = await _validate_source_url(su, ingredients)
-                data["source_url"] = su if ok else None
-            else:
-                data["source_url"] = None
+            data["source_url"] = _normalize_source_url(data.get("source_url")) if ingredients else None
+        _warm_source_url(data.get("source_url"), ingredients)
 
-        answer = build_step1_brief_message(data)
+        await _answer_from_step1(msg, data, status=status)
 
-        reply_markup: Optional[InlineKeyboardMarkup] = None
+        # ── Кладём в кэш только удачные разборы
         if data.get("error") != "no_inci" and ingredients:
-            token = _cache_put(
-                {
-                    "product_name": data.get("product_name"),
-                    "risk_level": data.get("risk_level"),
-                    "source_url": data.get("source_url"),
-                    "ingredients": ingredients,
-                }
-            )
-            reply_markup = _build_step1_keyboard(token)
+            payload = {
+                "product_name": data.get("product_name"),
+                "risk_level": data.get("risk_level"),
+                "source_url": data.get("source_url"),
+                "ingredients": ingredients,
+            }
+            await analytics.cache_put(cache_key, "step1", payload)
+            # Фото → запоминаем и под распознанным названием,
+            # чтобы текстовый запрос того же продукта тоже попал в кэш.
+            recognized = data.get("product_name")
+            if images and recognized:
+                await analytics.cache_put(step1_cache_key_text(recognized), "step1", payload)
 
-        await status.delete()
-        await msg.answer(answer, reply_markup=reply_markup)
+        await analytics.track(
+            kind=source,
+            user=user,
+            chat_id=msg.chat.id,
+            status="no_inci" if data.get("error") == "no_inci" else "ok",
+            source=source,
+            product=data.get("product_name") or product_name,
+            risk=data.get("risk_level"),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            model=usage.model,
+            in_tokens=usage.in_tokens,
+            cached_tokens=usage.cached_tokens,
+            out_tokens=usage.out_tokens,
+            tool_calls=usage.tool_calls,
+        )
 
     except Exception as e:
-        logging.error("STEP1 ERROR: %s", e)
+        logger.error("STEP1 ERROR: %s", e, exc_info=True)
+        await _drop_status()
+        await msg.answer(ERROR_GENERAL)
+        await analytics.track(
+            kind=source, user=user, chat_id=msg.chat.id, status="error", source=source,
+            product=product_name, latency_ms=int((time.monotonic() - t0) * 1000),
+            detail=f"{type(e).__name__}: {e}",
+        )
+    finally:
+        _release(user_id)
+
+
+# ─────────────────────────────────────────────────────────────
+# Фото: одиночное и альбомом
+# ─────────────────────────────────────────────────────────────
+
+# media_group_id → накопленные фото одного альбома
+_ALBUM_BUFFER: Dict[str, List[PhotoSize]] = {}
+
+
+async def _collect_images(bot: Bot, photos: Sequence[PhotoSize]) -> List[bytes]:
+    """Скачиваем фото параллельно — быстрее, чем по очереди."""
+    tasks = [_download_photo(bot, p) for p in photos[: config.ALBUM_MAX_PHOTOS]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    images: List[bytes] = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error("PHOTO DOWNLOAD ERROR: %s", r)
+            continue
+        images.append(_maybe_shrink(r))
+    return images
+
+
+async def _process_album(bot: Bot, msg: Message, group_id: str, caption: Optional[str]) -> None:
+    """Ждём остальные фото альбома и отправляем их ОДНИМ запросом в модель."""
+    t0 = time.monotonic()
+    status = await msg.answer(PROCESSING_PHOTO)
+    await asyncio.sleep(config.ALBUM_WAIT_SEC)
+
+    photos = _ALBUM_BUFFER.pop(group_id, [])
+    if not photos:
         try:
             await status.delete()
-        except Exception:
+        except Exception:  # noqa: BLE001
+            pass
+        _release(getattr(msg.from_user, "id", None))
+        return
+
+    images = await _collect_images(bot, photos)
+    if not images:
+        try:
+            await status.delete()
+        except Exception:  # noqa: BLE001
             pass
         await msg.answer(ERROR_GENERAL)
+        _release(getattr(msg.from_user, "id", None))
+        return
+
+    await _run_step1_and_answer(
+        msg, bot,
+        product_name=caption,
+        images=images,
+        status=status,
+        source="album" if len(images) > 1 else "photo",
+        started_at=t0,
+    )
 
 
 async def handle_photo(msg: Message, bot: Bot):
     if not msg.photo:
         return await msg.answer(ERROR_EMPTY)
 
-    photo = msg.photo[-1]
+    user_id = getattr(msg.from_user, "id", None)
+    caption = (msg.caption or "").strip() or None
+    group_id = msg.media_group_id if config.ALBUM_ENABLED else None
+
+    # ── Альбом: фото приходят отдельными апдейтами и обрабатываются параллельно,
+    #    поэтому «занимаем» группу синхронно, без единого await между проверкой и записью.
+    if group_id:
+        if group_id in _ALBUM_BUFFER:
+            _ALBUM_BUFFER[group_id].append(msg.photo[-1])
+            return
+        _ALBUM_BUFFER[group_id] = [msg.photo[-1]]
+
+        allowed, reason = _try_acquire(user_id)
+        if not allowed:
+            _ALBUM_BUFFER.pop(group_id, None)
+            await msg.answer(BUSY_MESSAGE)
+            await analytics.track(
+                kind="blocked", user=msg.from_user, chat_id=msg.chat.id,
+                status=reason, source="album",
+            )
+            return
+
+        asyncio.create_task(_process_album(bot, msg, group_id, caption))
+        return
+
+    allowed, reason = _try_acquire(user_id)
+    if not allowed:
+        await msg.answer(BUSY_MESSAGE)
+        await analytics.track(
+            kind="blocked", user=msg.from_user, chat_id=msg.chat.id,
+            status=reason, source="photo",
+        )
+        return
+
+    t0 = time.monotonic()
+    # Плашку «Анализирую фото» показываем СРАЗУ, параллельно со скачиванием —
+    # человек видит реакцию бота на ~секунду раньше.
+    status_task = asyncio.create_task(msg.answer(PROCESSING_PHOTO))
     try:
-        image_bytes = await _download_photo(bot, photo)
-    except Exception as e:
-        logging.error("PHOTO DOWNLOAD ERROR: %s", e)
+        images = await _collect_images(bot, [msg.photo[-1]])
+    except Exception as e:  # noqa: BLE001
+        logger.error("PHOTO DOWNLOAD ERROR: %s", e)
+        images = []
+
+    try:
+        status = await status_task
+    except Exception:  # noqa: BLE001
+        status = None
+
+    if not images:
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        _release(user_id)
+        await analytics.track(
+            kind="photo", user=msg.from_user, chat_id=msg.chat.id,
+            status="error", source="photo", detail="не удалось скачать фото",
+        )
         return await msg.answer(ERROR_GENERAL)
 
-    await _run_step1_and_answer(msg, bot, product_name=None, image_bytes=image_bytes)
+    await _run_step1_and_answer(
+        msg, bot, product_name=caption, images=images,
+        status=status, source="photo", started_at=t0,
+    )
 
 
 async def handle_text(msg: Message, bot: Bot):
@@ -726,8 +1089,30 @@ async def handle_text(msg: Message, bot: Bot):
     if text.startswith("/"):
         return
 
-    await _run_step1_and_answer(msg, bot, product_name=text, image_bytes=None)
+    if len(text) > config.MAX_QUERY_LEN:
+        await msg.answer(TOO_LONG_MESSAGE)
+        await analytics.track(
+            kind="blocked", user=msg.from_user, chat_id=msg.chat.id,
+            status="too_long", source="text", detail=f"{len(text)} символов",
+        )
+        return
 
+    user_id = getattr(msg.from_user, "id", None)
+    allowed, reason = _try_acquire(user_id)
+    if not allowed:
+        await msg.answer(BUSY_MESSAGE)
+        await analytics.track(
+            kind="blocked", user=msg.from_user, chat_id=msg.chat.id,
+            status=reason, source="text",
+        )
+        return
+
+    await _run_step1_and_answer(msg, bot, product_name=text, images=None, source="text")
+
+
+# ─────────────────────────────────────────────────────────────
+# Кнопки
+# ─────────────────────────────────────────────────────────────
 
 async def handle_composition_callback(cb: CallbackQuery):
     payload = cb.data or ""
@@ -736,20 +1121,72 @@ async def handle_composition_callback(cb: CallbackQuery):
 
     token = payload.split(":", 1)[1]
     step1_data = _cache_get(token)
-    if not step1_data:
+    if not step1_data or cb.message is None:
         await cb.answer("Эта кнопка уже неактуальна. Отправь запрос заново.", show_alert=True)
         return
 
     await cb.answer()
-    await cb.message.answer(build_composition_message(step1_data), reply_markup=_build_step1_keyboard(token))
+
+    t0 = time.monotonic()
+    # Ссылку-источник проверяем здесь (обычно уже прогрета в фоне и это мгновенно)
+    data = dict(step1_data)
+    url = data.get("source_url")
+    if url:
+        ok = await _source_url_ok(url, data.get("ingredients") or [])
+        data["source_url"] = url if ok else None
+
+    await cb.message.answer(build_composition_message(data), reply_markup=_build_step1_keyboard(token))
+    await analytics.track(
+        kind="composition",
+        user=cb.from_user,
+        chat_id=cb.message.chat.id,
+        product=data.get("product_name"),
+        risk=data.get("risk_level"),
+        latency_ms=int((time.monotonic() - t0) * 1000),
+    )
 
 
-async def _run_step2_background(bot: Bot, chat_id: int, step1_data: Dict[str, Any], token: str) -> None:
+async def _run_step2_background(
+    bot: Bot,
+    chat_id: int,
+    step1_data: Dict[str, Any],
+    token: str,
+    user: Any = None,
+) -> None:
+    t0 = time.monotonic()
+    key = step2_cache_key(step1_data)
     try:
-        raw2 = await run_agent_step2(step1_data)
-        step2_json = _parse_agent_json(raw2)
+        cached = await analytics.cache_get(key)
+        if cached:
+            await bot.send_message(
+                chat_id,
+                build_step2_message(
+                    cached,
+                    product_name=step1_data.get("product_name"),
+                    risk_level=step1_data.get("risk_level"),
+                ),
+            )
+            await analytics.track(
+                kind="step2", user=user, chat_id=chat_id, cached=True,
+                product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            return
+
+        result = await run_agent_step2_ex(step1_data)
+        step2_json = _parse_agent_json(result.raw)
+        usage = result.usage
+
         if not step2_json:
             await bot.send_message(chat_id, "Не удалось сформировать пояснение. Попробуй ещё раз.")
+            await analytics.track(
+                kind="step2", user=user, chat_id=chat_id, status="error",
+                product=step1_data.get("product_name"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                model=usage.model, in_tokens=usage.in_tokens, cached_tokens=usage.cached_tokens,
+                out_tokens=usage.out_tokens, tool_calls=usage.tool_calls,
+                detail="шаг 2 вернул не-JSON",
+            )
             return
 
         await bot.send_message(
@@ -760,12 +1197,26 @@ async def _run_step2_background(bot: Bot, chat_id: int, step1_data: Dict[str, An
                 risk_level=step1_data.get("risk_level"),
             ),
         )
+        await analytics.cache_put(key, "step2", step2_json)
+        await analytics.track(
+            kind="step2", user=user, chat_id=chat_id,
+            product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            model=usage.model, in_tokens=usage.in_tokens, cached_tokens=usage.cached_tokens,
+            out_tokens=usage.out_tokens, tool_calls=usage.tool_calls,
+        )
     except Exception as e:
-        logging.error("STEP2 BACKGROUND ERROR: %s", e)
+        logger.error("STEP2 BACKGROUND ERROR: %s", e, exc_info=True)
         try:
             await bot.send_message(chat_id, "Не удалось сформировать пояснение. Попробуй ещё раз.")
         except Exception:
             pass
+        await analytics.track(
+            kind="step2", user=user, chat_id=chat_id, status="error",
+            product=step1_data.get("product_name"),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            detail=f"{type(e).__name__}: {e}",
+        )
     finally:
         _cache_del(token)
 
@@ -777,7 +1228,7 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
 
     token = payload.split(":", 1)[1]
     step1_data = _cache_get(token)
-    if not step1_data:
+    if not step1_data or cb.message is None:
         await cb.answer("Эта кнопка уже неактуальна. Отправь запрос заново.", show_alert=True)
         return
 
@@ -791,7 +1242,23 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
     await cb.message.answer(PROCESSING_STEP2)
 
     chat_id = cb.message.chat.id
-    asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token))
+    asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token, cb.from_user))
+
+
+# ─────────────────────────────────────────────────────────────
+# Фоновая уборка
+# ─────────────────────────────────────────────────────────────
+
+async def _housekeeping() -> None:
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            _sweep_memory_caches()
+            await analytics.maintenance()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Уборка не удалась: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -801,6 +1268,8 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
 async def _main_async():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    analytics.init()
 
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
@@ -815,20 +1284,42 @@ async def _main_async():
     dp.message.register(handle_contacts, Command("contacts"))
     dp.message.register(handle_base, Command("base"))
 
+    # Скрытые админ-команды — ДО общего текстового хендлера
+    admin.register(dp)
+
     dp.message.register(handle_photo, F.photo)
     dp.message.register(handle_text, F.text)
 
     dp.callback_query.register(handle_composition_callback, F.data.startswith("composition:"))
     dp.callback_query.register(handle_step2_callback, F.data.startswith("step2:"))
 
-    logging.info("CreamcheckBot started (FINAL BALANCED UX)")
+    logger.info("CreamcheckBot started (FINAL BALANCED UX)")
 
-    await _run_health_server()
-    await dp.start_polling(bot)
+    await dashboard.start()
+    housekeeper = asyncio.create_task(_housekeeping())
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        housekeeper.cancel()
+        await dashboard.stop()
+        if _http is not None and not _http.is_closed:
+            await _http.aclose()
+        try:
+            from agent.agent import aclose as agent_close
+
+            await agent_close()
+        except Exception:  # noqa: BLE001
+            pass
+        await bot.session.close()
+        analytics.close()
 
 
 def main():
-    asyncio.run(_main_async())
+    try:
+        asyncio.run(_main_async())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("CreamcheckBot остановлен")
 
 
 if __name__ == "__main__":
