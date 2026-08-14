@@ -27,7 +27,6 @@ from openai import AsyncOpenAI
 
 from bot import config
 
-from .comedogen_base import hard_comedogens, conditional_comedogens
 from .groups import FALLBACK_GROUP, GROUP_ORDER, groups_prompt_hint, normalize_group
 
 load_dotenv()
@@ -716,36 +715,53 @@ def build_ingredients_payload(step1_payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"product_name": step1_payload.get("product_name"), "items": items}
 
 
+# Достоверность пояснения. Показываем пользователю только `thin`: это признание
+# модели, что надёжных данных мало, и оно ценнее правдоподобной выдумки.
+SRC_WEB = "web"
+SRC_KNOWN = "known"
+SRC_THIN = "thin"
+_SRC_VALUES = (SRC_WEB, SRC_KNOWN, SRC_THIN)
+
+_FIELD_RE = re.compile(r"\|\s*(grp|src|note|ask)\s*=", re.I)
+
+
 def _parse_ingredients_marked_text(text: str) -> Dict[int, Dict[str, str]]:
-    """Разбирает строки вида `- 7 | grp=emol | note=...` в {номер: {grp, note}}.
+    """Разбирает `- 7 | grp=emol | src=web | note=… | ask=…` в {номер: поля}.
 
     Построчный формат вместо JSON выбран намеренно: если ответ модели обрежется
     по лимиту токенов, уцелевшие строки всё равно разберутся, а оборванный JSON
-    пропал бы целиком.
+    пропал бы целиком. Границы полей ищем регуляркой, а не простым split("|"),
+    чтобы вертикальная черта внутри текста не съедала хвост пояснения.
     """
     out: Dict[int, Dict[str, str]] = {}
     for line in (text or "").splitlines():
         s = _strip_bullets(line)
-        if not s or "|" not in s:
+        if not s:
             continue
 
-        parts = [p.strip() for p in s.split("|")]
+        marks = list(_FIELD_RE.finditer(s))
+        if not marks:
+            continue
+
         try:
-            num = int(re.sub(r"[^0-9]", "", parts[0]))
-        except (ValueError, IndexError):
+            num = int(re.sub(r"[^0-9]", "", s[: marks[0].start()]))
+        except ValueError:
+            continue
+        if num <= 0:
             continue
 
-        grp = FALLBACK_GROUP
-        note = ""
-        for p in parts[1:]:
-            pl = p.lower()
-            if pl.startswith("grp="):
-                grp = normalize_group(p.split("=", 1)[1])
-            elif pl.startswith("note="):
-                note = p.split("=", 1)[1].strip()
+        fields: Dict[str, str] = {}
+        for i, m in enumerate(marks):
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(s)
+            fields[m.group(1).lower()] = s[m.end() : end].strip()
 
-        if num > 0:
-            out[num] = {"grp": grp, "note": note}
+        src = fields.get("src", "").lower()
+        out[num] = {
+            "grp": normalize_group(fields.get("grp", FALLBACK_GROUP)),
+            "src": src if src in _SRC_VALUES else "",
+            "note": fields.get("note", ""),
+            "ask": fields.get("ask", ""),
+        }
     return out
 
 
@@ -769,6 +785,12 @@ def _assemble_groups(
             entry["type"] = item["mark"]
         if info.get("note"):
             entry["note"] = info["note"]
+        if info.get("ask"):
+            entry["ask"] = info["ask"]
+        # Отметку достоверности несём дальше только когда данных мало:
+        # остальные значения пользователю ничего не дают.
+        if info.get("src") == SRC_THIN:
+            entry["thin"] = True
 
         buckets.setdefault(key, []).append(entry)
 

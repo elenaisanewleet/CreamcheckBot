@@ -112,7 +112,11 @@ def test_text_query_answers_and_attaches_buttons(monkeypatch):
     assert "@DrDubinsky" in answer.text
 
     buttons = [b.text for row in answer.reply_markup.inline_keyboard for b in row]
-    assert buttons == ["🧾 Посмотреть состав", "📘 Подробнее"]
+    assert buttons == ["🧾 Посмотреть состав", "📘 Подробнее", botmod.BTN_DOCTOR_DIRECT]
+    # Врач доступен с самого первого экрана: разбор состава не отвечает
+    # на вопрос «подойдёт ли это именно мне».
+    links = [b.url for row in answer.reply_markup.inline_keyboard for b in row if b.url]
+    assert links == [botmod.DOCTOR_URL]
     assert len(calls) == 1
 
 

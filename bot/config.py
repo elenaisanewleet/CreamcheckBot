@@ -154,8 +154,8 @@ STEP2_REASONING_EFFORT: str = env_str("STEP2_REASONING_EFFORT", "").lower()
 # Выход крупный: пояснение по каждому из 25–45 компонентов.
 INGREDIENTS_ENABLED: bool = env_bool("INGREDIENTS_ENABLED", True)
 INGREDIENTS_WEB_SEARCH: bool = env_bool("INGREDIENTS_WEB_SEARCH", True)
-INGREDIENTS_MAX_TOOL_CALLS: int = env_int("INGREDIENTS_MAX_TOOL_CALLS", 4)
-INGREDIENTS_MAX_OUTPUT_TOKENS: int = env_int("INGREDIENTS_MAX_OUTPUT_TOKENS", 4000)
+INGREDIENTS_MAX_TOOL_CALLS: int = env_int("INGREDIENTS_MAX_TOOL_CALLS", 8)
+INGREDIENTS_MAX_OUTPUT_TOKENS: int = env_int("INGREDIENTS_MAX_OUTPUT_TOKENS", 6000)
 INGREDIENTS_REASONING_EFFORT: str = env_str("INGREDIENTS_REASONING_EFFORT", "").lower()
 
 # Ключ prompt-кэша OpenAI: одинаковый префикс промпта переиспользуется дешевле.

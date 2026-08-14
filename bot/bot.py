@@ -459,11 +459,21 @@ BTN_DOCTOR = "❓ Что спросить у врача"
 BTN_GROUPS = "🧩 Что делает каждый компонент"
 
 
+BTN_DOCTOR_DIRECT = "🩺 Спросить дерматолога"
+
+
+def _doctor_link_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=BTN_DOCTOR_DIRECT, url=DOCTOR_URL)
+
+
 def _build_step1_keyboard(token: str) -> InlineKeyboardMarkup:
+    # Кнопка к врачу есть уже здесь: разбор состава не отвечает на вопрос
+    # «подойдёт ли это мне», и предложить живого специалиста уместно сразу.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🧾 Посмотреть состав", callback_data=f"composition:{token}")],
             [InlineKeyboardButton(text="📘 Подробнее", callback_data=f"step2:{token}")],
+            [_doctor_link_button()],
         ]
     )
 
@@ -475,6 +485,8 @@ def _build_step2_keyboard(token: str, *, has_questions: bool) -> Optional[Inline
         rows.append([InlineKeyboardButton(text=BTN_GROUPS, callback_data=f"groups:{token}")])
     if has_questions:
         rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    else:
+        rows.append([_doctor_link_button()])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
@@ -498,13 +510,32 @@ def _build_groups_keyboard(
         )
     if has_questions:
         rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    else:
+        rows.append([_doctor_link_button()])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _build_group_card_keyboard(token: str, *, has_questions: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="← Все группы", callback_data=f"groups:{token}")]]
+def _build_group_card_keyboard(
+    token: str, group: Dict[str, Any], *, has_questions: bool
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    # Вопросы по этой конкретной группе — ближе к тому, что человек только что
+    # прочитал, чем общий список по всему средству.
+    own = group_questions(group)
+    if own:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🩺 {_plural_questions(len(own))} по этой группе",
+                callback_data=f"gq:{token}:{group.get('key')}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton(text="← Все группы", callback_data=f"groups:{token}")])
     if has_questions:
         rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    else:
+        rows.append([_doctor_link_button()])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -923,9 +954,21 @@ def build_group_card_message(
         pos_txt = f" · №{pos}" if isinstance(pos, int) else ""
 
         lines.append(f"{mark} <b>{_esc(name)}</b>{pos_txt}")
+
         note = _clean_text(item.get("note") or "")
         if note:
             lines.append(_esc(note))
+
+        # Модель призналась, что надёжных данных мало. Показываем это честно:
+        # признание полезнее правдоподобной выдумки, и это сам по себе повод
+        # спросить у врача.
+        if item.get("thin"):
+            lines.append("🔸 <i>Надёжных данных по нему немного — додумывать не буду.</i>")
+
+        ask = _clean_text(item.get("ask") or "")
+        if ask:
+            lines.append(f"🩺 <i>{_esc(ask)}</i>")
+
         lines.append("")
 
     while lines and lines[-1] == "":
@@ -933,6 +976,70 @@ def build_group_card_message(
 
     lines.append("")
     lines.append(DIVIDER_LIGHT)
+    lines.append("")
+
+    if group_questions(group):
+        lines.append("🩺 <b>Отмеченное — то, что зависит от твоей кожи</b>, "
+                     "а не от состава. Здесь я могу только назвать вопрос — "
+                     "ответ даёт врач на осмотре.")
+    else:
+        lines.append("💭 <i>Это состав, а не консультация: как отреагирует "
+                     "именно твоя кожа, состав не показывает.</i>")
+
+    return "\n".join(lines).strip()
+
+
+def group_questions(group: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Вопросы врачу, выросшие из компонентов одной группы."""
+    out: List[Dict[str, str]] = []
+    for item in group.get("items") or []:
+        ask = _clean_text(item.get("ask") or "")
+        name = (item.get("name") or "").strip()
+        if ask and name:
+            out.append({"name": name, "ask": ask})
+    return out
+
+
+def build_group_questions_message(
+    data: Dict[str, Any], group: Dict[str, Any]
+) -> str:
+    """Экран вопросов врачу по одной группе компонентов."""
+    product_name = data.get("product_name") or "Продукт"
+    questions = group_questions(group)
+
+    lines = [
+        DIVIDER_ACCENT,
+        "",
+        "<b>Что спросить у врача</b> ❓",
+        f"по группе «{group_label(group.get('key') or '')}»",
+        "",
+        f"🧴 <b>{_esc(product_name)}</b>",
+        "",
+        DIVIDER_LIGHT,
+        "",
+        "Про сами компоненты я рассказала всё, что известно. "
+        "А дальше начинается то, что зависит от тебя — и вот об этом "
+        "стоит спросить на приёме 👇",
+        "",
+    ]
+
+    for item in questions:
+        lines.append(f"🩺 <b>{_esc(item['name'])}</b>")
+        lines.append(_esc(item["ask"]))
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    lines.extend([
+        "",
+        DIVIDER_LIGHT,
+        "",
+        "🩵 <b>Лиза Дубинская</b> — дерматолог.",
+        "Можно написать напрямую и показать этот разбор.",
+        "",
+        DIVIDER_ACCENT,
+    ])
 
     return "\n".join(lines).strip()
 
@@ -1674,12 +1781,49 @@ async def handle_group_card_callback(cb: CallbackQuery):
         cb.message,
         build_group_card_message(step1_data, group),
         reply_markup=_build_group_card_keyboard(
-            token, has_questions=bool(_doctor_questions(token))
+            token, group, has_questions=bool(_doctor_questions(token))
         ),
     )
     await analytics.track(
         kind="group", user=cb.from_user, chat_id=cb.message.chat.id,
         product=step1_data.get("product_name"), detail=group_key,
+    )
+
+
+async def handle_group_questions_callback(cb: CallbackQuery):
+    """Вопросы врачу по одной группе — из пометок ask у её компонентов."""
+    payload = cb.data or ""
+    if not payload.startswith("gq:"):
+        return
+
+    parts = payload.split(":", 2)
+    if len(parts) < 3:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    _, token, group_key = parts
+    step1_data = _cache_get(token)
+    data = _slot_get(token, "ingredients")
+    if not step1_data or not data or cb.message is None:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    group = next(
+        (g for g in (data.get("groups") or []) if g.get("key") == group_key), None
+    )
+    if not group or not group_questions(group):
+        await cb.answer("По этой группе вопросов не набралось.", show_alert=True)
+        return
+
+    await cb.answer()
+    await _answer_long(
+        cb.message,
+        build_group_questions_message(step1_data, group),
+        reply_markup=_build_doctor_keyboard(token),
+    )
+    await analytics.track(
+        kind="doctor", user=cb.from_user, chat_id=cb.message.chat.id,
+        product=step1_data.get("product_name"), detail=f"group:{group_key}",
     )
 
 
@@ -1755,6 +1899,7 @@ async def _main_async():
     dp.callback_query.register(handle_step2_callback, F.data.startswith("step2:"))
     dp.callback_query.register(handle_groups_callback, F.data.startswith("groups:"))
     dp.callback_query.register(handle_group_card_callback, F.data.startswith("grp:"))
+    dp.callback_query.register(handle_group_questions_callback, F.data.startswith("gq:"))
     dp.callback_query.register(handle_doctor_callback, F.data.startswith("doc:"))
 
     logger.info("CreamcheckBot started (FINAL BALANCED UX)")

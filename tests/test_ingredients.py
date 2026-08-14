@@ -131,11 +131,39 @@ def buttons(markup):
 
 def test_parses_marked_lines():
     parsed = _parse_ingredients_marked_text(
-        "- 1 | grp=tex | note=Вода — основа эмульсии.\n"
-        "- 2 | grp=humec | note=Глицерин удерживает влагу."
+        "- 1 | grp=tex | src=known | note=Вода — основа эмульсии.\n"
+        "- 2 | grp=humec | src=web | note=Глицерин удерживает влагу. "
+        "| ask=Сколько его нужно твоей коже — зависит от сухости."
     )
-    assert parsed[1] == {"grp": "tex", "note": "Вода — основа эмульсии."}
+    assert parsed[1] == {
+        "grp": "tex", "src": "known", "note": "Вода — основа эмульсии.", "ask": "",
+    }
     assert parsed[2]["grp"] == "humec"
+    assert parsed[2]["ask"].startswith("Сколько его нужно")
+
+
+def test_parses_confidence_and_question():
+    parsed = _parse_ingredients_marked_text(
+        "- 3 | grp=fragr | src=thin | note=Экстракт, данных мало. "
+        "| ask=Если бывали реакции на растительное — это твой случай."
+    )
+    assert parsed[3]["src"] == "thin"
+    assert "реакции" in parsed[3]["ask"]
+
+
+def test_unknown_confidence_is_dropped():
+    """Чужое значение src не должно попадать дальше как признак достоверности."""
+    parsed = _parse_ingredients_marked_text("- 1 | grp=tex | src=абсолютно | note=Вода.")
+    assert parsed[1]["src"] == ""
+
+
+def test_pipe_inside_note_does_not_eat_the_tail():
+    """Вертикальная черта внутри текста не должна обрезать пояснение."""
+    parsed = _parse_ingredients_marked_text(
+        "- 1 | grp=tex | src=known | note=Вода | основа всего. | ask=Вопрос?"
+    )
+    assert parsed[1]["note"] == "Вода | основа всего."
+    assert parsed[1]["ask"] == "Вопрос?"
 
 
 def test_unknown_group_falls_back():
@@ -264,6 +292,119 @@ def test_group_card_shows_marks_positions_and_notes():
     assert "Минеральный окклюзив" in text
 
 
+GROUP_WITH_QUESTIONS = {
+    "key": "activ",
+    "items": [
+        {"name": "Retinol", "position": 6, "type": "conditional",
+         "note": "Производное витамина A, ускоряет обновление кожи.",
+         "ask": "Совместим ли он с твоим текущим уходом — зависит от состояния барьера."},
+        {"name": "Centella Extract", "position": 22,
+         "note": "Растительный экстракт, данные о действии расходятся.",
+         "thin": True,
+         "ask": "Если бывали реакции на растительные компоненты — это твой случай."},
+        {"name": "Niacinamide", "position": 8, "note": "Витамин B3."},
+    ],
+}
+
+
+def test_thin_data_is_admitted_not_invented():
+    """Признание «данных мало» должно доходить до человека, а не прятаться."""
+    text = botmod.build_group_card_message(STEP1, GROUP_WITH_QUESTIONS)
+    assert "Надёжных данных по нему немного" in text
+    # ...и ровно один раз — только у того компонента, что помечен
+    assert text.count("Надёжных данных") == 1
+
+
+def test_open_questions_are_rendered_per_component():
+    text = botmod.build_group_card_message(STEP1, GROUP_WITH_QUESTIONS)
+    assert "🩺 <i>Совместим ли он с твоим текущим уходом" in text
+    assert "зависит от твоей кожи" in text  # пояснение к пометкам внизу
+    # У ниацинамида вопроса нет — выдуманный не подставляется
+    assert text.count("🩺 <i>") == 2
+
+
+def test_group_questions_collects_only_real_ones():
+    got = botmod.group_questions(GROUP_WITH_QUESTIONS)
+    assert [q["name"] for q in got] == ["Retinol", "Centella Extract"]
+    assert botmod.group_questions(INGREDIENTS_DATA["groups"][0]) == []
+
+
+def test_card_without_questions_still_says_it_is_not_a_consultation():
+    text = botmod.build_group_card_message(STEP1, INGREDIENTS_DATA["groups"][0])
+    assert "не консультация" in text
+
+
+def test_group_questions_screen_leads_to_the_doctor():
+    text = botmod.build_group_questions_message(STEP1, GROUP_WITH_QUESTIONS)
+    assert "Retinol" in text and "Centella Extract" in text
+    assert "Niacinamide" not in text
+    assert "Лиза Дубинская" in text
+    assert_telegram_html_safe(text)
+
+
+def test_group_card_button_counts_its_questions():
+    labels = buttons(botmod._build_group_card_keyboard(
+        "tok", GROUP_WITH_QUESTIONS, has_questions=True))
+    assert "🩺 2 вопроса по этой группе" in labels
+    # У группы без вопросов такой кнопки нет
+    plain_labels = buttons(botmod._build_group_card_keyboard(
+        "tok", INGREDIENTS_DATA["groups"][0], has_questions=True))
+    assert not any("по этой группе" in x for x in plain_labels)
+
+
+def test_group_questions_callback(monkeypatch):
+    data = {"groups": [GROUP_WITH_QUESTIONS]}
+
+    async def _run(step1_payload):
+        return AgentResult(raw=json.dumps(data), usage=Usage())
+
+    monkeypatch.setattr(botmod, "run_agent_ingredients_ex", _run)
+    token = botmod._cache_put(STEP1)
+    run(botmod.handle_groups_callback(FakeCallback(f"groups:{token}")))
+
+    cb = FakeCallback(f"gq:{token}:activ")
+    run(botmod.handle_group_questions_callback(cb))
+    assert "Что спросить у врача" in cb.message.sent[-1].text
+    assert any(b.url for row in cb.message.sent[-1].reply_markup.inline_keyboard for b in row)
+
+
+def test_group_questions_callback_refuses_empty_group(monkeypatch):
+    async def _run(step1_payload):
+        return AgentResult(raw=json.dumps(INGREDIENTS_DATA), usage=Usage())
+
+    monkeypatch.setattr(botmod, "run_agent_ingredients_ex", _run)
+    token = botmod._cache_put(STEP1)
+    run(botmod.handle_groups_callback(FakeCallback(f"groups:{token}")))
+
+    cb = FakeCallback(f"gq:{token}:emol")
+    run(botmod.handle_group_questions_callback(cb))
+    assert cb.answers[-1][1] is True
+    assert cb.message.sent == []
+
+
+def test_ask_and_thin_survive_assembly():
+    payload = build_ingredients_payload(STEP1)
+    parsed = _parse_ingredients_marked_text(
+        "- 3 | grp=emol | src=thin | note=Мало данных. | ask=Твой ли это случай?"
+    )
+    item = next(
+        it for g in _assemble_groups(payload, parsed)["groups"]
+        for it in g["items"] if it["name"] == "Petrolatum"
+    )
+    assert item["thin"] is True
+    assert item["ask"] == "Твой ли это случай?"
+
+
+def test_confident_components_carry_no_thin_flag():
+    payload = build_ingredients_payload(STEP1)
+    parsed = _parse_ingredients_marked_text("- 1 | grp=tex | src=known | note=Вода.")
+    item = next(
+        it for g in _assemble_groups(payload, parsed)["groups"]
+        for it in g["items"] if it["name"] == "Aqua"
+    )
+    assert "thin" not in item
+
+
 def test_group_card_survives_missing_note():
     group = {"key": "tex", "items": [{"name": "Aqua", "position": 1}]}
     text = botmod.build_group_card_message(STEP1, group)
@@ -374,11 +515,22 @@ def test_step2_keyboard_hides_doctor_without_questions():
     assert botmod.BTN_DOCTOR not in buttons(botmod._build_step2_keyboard("t", has_questions=False))
 
 
-def test_step2_keyboard_is_none_when_nothing_to_show(monkeypatch):
-    """Telegram отклоняет разметку без кнопок — в этом случае нужен None."""
+def test_every_screen_offers_the_doctor(monkeypatch):
+    """К врачу должно вести с любого экрана, даже когда вопросов не набралось."""
     monkeypatch.setattr(botmod.config, "INGREDIENTS_ENABLED", False)
-    assert botmod._build_step2_keyboard("t", has_questions=False) is None
-    assert botmod._build_step2_keyboard("t", has_questions=True) is not None
+
+    bare = botmod._build_step2_keyboard("t", has_questions=False)
+    assert botmod.BTN_DOCTOR_DIRECT in buttons(bare)
+
+    groups = botmod._build_groups_keyboard("t", INGREDIENTS_DATA["groups"], has_questions=False)
+    assert botmod.BTN_DOCTOR_DIRECT in buttons(groups)
+
+    card = botmod._build_group_card_keyboard(
+        "t", INGREDIENTS_DATA["groups"][0], has_questions=False
+    )
+    assert botmod.BTN_DOCTOR_DIRECT in buttons(card)
+
+    assert botmod.BTN_DOCTOR_DIRECT in buttons(botmod._build_step1_keyboard("t"))
 
 
 # ─────────────────────────────────────────────────────────────

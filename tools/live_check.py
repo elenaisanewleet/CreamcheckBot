@@ -107,6 +107,10 @@ async def check(product: str, show_raw: bool) -> dict:
         1 for g in ing.get("groups") or [] for it in g.get("items") or [] if it.get("note")
     )
 
+    items = [it for g in ing.get("groups") or [] for it in g.get("items") or []]
+    asked = [it for it in items if it.get("ask")]
+    thin = [it for it in items if it.get("thin")]
+
     rule("ПРОВЕРКА", "━")
     print(f"рекомендаций: {len(recs)}, привязано к составу: {len(tied)}")
     for r in recs:
@@ -116,13 +120,28 @@ async def check(product: str, show_raw: bool) -> dict:
     print(f"\nвопросов врачу: {len(questions)} (ожидается 3)")
     print(f"компонентов с пояснением: {explained} из {len(names)}")
     if explained < len(names):
-        missing = [
-            it.get("name")
-            for g in ing.get("groups") or []
-            for it in g.get("items") or []
-            if not it.get("note")
-        ]
+        missing = [it.get("name") for it in items if not it.get("note")]
         print(f"  без пояснения: {', '.join(filter(None, missing))}")
+
+    # Открытые вопросы — то, ради чего человек идёт к врачу.
+    print(f"\nкомпонентов с вопросом врачу: {len(asked)} из {len(names)}")
+    for it in asked[:8]:
+        print(f"  🩺 {it['name']}: {it['ask'][:90]}")
+    if len(asked) > 8:
+        print(f"  … и ещё {len(asked) - 8}")
+    if not asked:
+        print("  ✗ НИ ОДНОГО — человеку не с чем идти к врачу, промпт не сработал")
+
+    # Признания «данных мало» — это не брак, а честность.
+    print(f"\nпомечено «данных мало»: {len(thin)}")
+    for it in thin:
+        print(f"  🔸 {it['name']}")
+
+    groups_with_q = sum(
+        1 for g in ing.get("groups") or [] if any(i.get("ask") for i in g.get("items") or [])
+    )
+    total_groups = len(ing.get("groups") or [])
+    print(f"\nгрупп с вопросами врачу: {groups_with_q} из {total_groups}")
 
     from bot.analytics import estimate_cost
 
@@ -144,6 +163,8 @@ async def check(product: str, show_raw: bool) -> dict:
         "tied": len(tied),
         "questions": len(questions),
         "explained": explained,
+        "asked": len(asked),
+        "thin": len(thin),
         "total": len(names),
     }
 
@@ -172,7 +193,8 @@ async def main() -> None:
             print(f"✗ {r['product']}: не разобрано")
             continue
         print(f"{r['product']}: рекомендаций {r['tied']}/{r['recs']} по составу, "
-              f"вопросов {r['questions']}, пояснений {r['explained']}/{r['total']}")
+              f"вопросов врачу {r['questions']}, пояснений {r['explained']}/{r['total']}, "
+              f"открытых вопросов {r['asked']}, «данных мало» {r['thin']}")
 
 
 if __name__ == "__main__":
