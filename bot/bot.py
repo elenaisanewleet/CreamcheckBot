@@ -16,6 +16,7 @@ ComedoBot — Telegram bot (aiogram 3) — FINAL BALANCED VERSION
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import re
@@ -37,7 +38,14 @@ from aiogram.types import (
 
 from . import admin, analytics, config, dashboard
 from .config import TELEGRAM_BOT_TOKEN
-from agent.agent import run_agent_step1_ex, run_agent_step2_ex, build_step2_payload
+from agent.agent import (
+    build_ingredients_payload,
+    build_step2_payload,
+    run_agent_ingredients_ex,
+    run_agent_step1_ex,
+    run_agent_step2_ex,
+)
+from agent.groups import group_label, is_valid_group
 from agent.comedogen_base import hard_comedogens, conditional_comedogens
 
 
@@ -160,6 +168,8 @@ CONTACTS_MESSAGE = f"""<b>Контакты</b> 🫧
 PROCESSING_PHOTO = "🫧 Анализирую фото…"
 PROCESSING_TEXT = "🫧 Ищу состав…"
 PROCESSING_STEP2 = "🫧 Готовлю подробное пояснение…"
+PROCESSING_INGREDIENTS = "🫧 Разбираю состав по компонентам — это займёт полминуты…"
+ERROR_INGREDIENTS = "Не удалось разобрать состав по компонентам. Попробуй ещё раз."
 ERROR_GENERAL = "Не удалось обработать запрос. Попробуй ещё раз или отправь другое фото."
 ERROR_EMPTY = "Отправь фото средства или напиши его название."
 BUSY_MESSAGE = "🫧 Ещё разбираю предыдущий запрос — отвечу через несколько секунд."
@@ -399,10 +409,13 @@ def calc_risk_level_strict(ingredients: List[Dict[str, Any]]) -> str:
     return "none"
 
 
-# Кэш для шага 2 (в памяти)
+# Состояние одного разбора в памяти: данные шага 1 плюс всё, что человек
+# успел раскрыть кнопками. Живёт, пока по кнопкам ходят, — каждое обращение
+# продлевает срок. Час без действий — и токен убирает уборщик.
 STEP2_CACHE: Dict[str, Dict[str, Any]] = {}
-STEP2_CACHE_TTL_SEC = 15 * 60
+STEP2_CACHE_TTL_SEC = 60 * 60
 STEP2_INFLIGHT: Dict[str, float] = {}
+INGREDIENTS_INFLIGHT: Dict[str, float] = {}
 
 
 def _cache_put(step1_data: Dict[str, Any]) -> str:
@@ -418,13 +431,30 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
     if time.time() - float(item.get("ts", 0)) > STEP2_CACHE_TTL_SEC:
         STEP2_CACHE.pop(token, None)
         STEP2_INFLIGHT.pop(token, None)
+        INGREDIENTS_INFLIGHT.pop(token, None)
         return None
+    # Человек листает карточки — значит разбор ещё нужен.
+    item["ts"] = time.time()
     return item.get("data")
+
+
+def _slot_get(token: str, slot: str) -> Optional[Dict[str, Any]]:
+    """Готовый шаг 2 / разбор состава для этого токена, если уже считали."""
+    item = STEP2_CACHE.get(token)
+    return (item or {}).get(slot)
+
+
+def _slot_put(token: str, slot: str, value: Dict[str, Any]) -> None:
+    item = STEP2_CACHE.get(token)
+    if item is not None:
+        item[slot] = value
+        item["ts"] = time.time()
 
 
 def _cache_del(token: str) -> None:
     STEP2_CACHE.pop(token, None)
     STEP2_INFLIGHT.pop(token, None)
+    INGREDIENTS_INFLIGHT.pop(token, None)
 
 
 def _sweep_memory_caches() -> None:
@@ -435,8 +465,11 @@ def _sweep_memory_caches() -> None:
     for t in stale:
         STEP2_CACHE.pop(t, None)
         STEP2_INFLIGHT.pop(t, None)
+        INGREDIENTS_INFLIGHT.pop(t, None)
     for t in [t for t, ts in STEP2_INFLIGHT.items() if now - ts > 600]:
         STEP2_INFLIGHT.pop(t, None)
+    for t in [t for t, ts in INGREDIENTS_INFLIGHT.items() if now - ts > 600]:
+        INGREDIENTS_INFLIGHT.pop(t, None)
     if stale:
         logger.debug("Очищено %d просроченных токенов", len(stale))
 
@@ -449,6 +482,12 @@ def _parse_agent_json(raw: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+DOCTOR_URL = f"https://t.me/{config.DOCTOR_USERNAME}"
+
+BTN_DOCTOR = "❓ Что спросить у врача"
+BTN_GROUPS = "🧩 Что делает каждый компонент"
+
+
 def _build_step1_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -458,12 +497,76 @@ def _build_step1_keyboard(token: str) -> InlineKeyboardMarkup:
     )
 
 
+def _build_step2_keyboard(token: str, *, has_questions: bool) -> Optional[InlineKeyboardMarkup]:
+    """None вместо пустой клавиатуры: Telegram не принимает разметку без кнопок."""
+    rows = []
+    if config.INGREDIENTS_ENABLED:
+        rows.append([InlineKeyboardButton(text=BTN_GROUPS, callback_data=f"groups:{token}")])
+    if has_questions:
+        rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def _build_groups_keyboard(
+    token: str, groups: Sequence[Dict[str, Any]], *, has_questions: bool
+) -> InlineKeyboardMarkup:
+    """Кнопка на каждую непустую группу; счётчик показывает, сколько внутри."""
+    rows = []
+    for grp in groups:
+        key = grp.get("key")
+        items = grp.get("items") or []
+        if not key or not items or not is_valid_group(key):
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{group_label(key)} · {len(items)}",
+                    callback_data=f"grp:{token}:{key}",
+                )
+            ]
+        )
+    if has_questions:
+        rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_group_card_keyboard(token: str, *, has_questions: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="← Все группы", callback_data=f"groups:{token}")]]
+    if has_questions:
+        rows.append([InlineKeyboardButton(text=BTN_DOCTOR, callback_data=f"doc:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_doctor_keyboard(token: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"💬 Написать @{config.DOCTOR_USERNAME}", url=DOCTOR_URL
+            )
+        ]
+    ]
+    if config.INGREDIENTS_ENABLED:
+        rows.append([InlineKeyboardButton(text="← К составу", callback_data=f"groups:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _mark_for_component(is_hard: bool, is_cond: bool) -> str:
     if is_hard:
         return "🔴"
     if is_cond:
         return "🟠"
     return "⚪️"
+
+
+def _esc(t: Any) -> str:
+    """Экранирует текст перед вставкой в HTML-разметку сообщения.
+
+    Сюда попадают названия продуктов и ингредиентов, а также пояснения от
+    модели. В INCI регулярно встречаются смеси вида «Tocopherol & Ascorbyl
+    Palmitate», а в тексте — сравнения вроде «<1%». Без экранирования Telegram
+    отвечает `can't parse entities`, и человек не получает сообщение вообще.
+    """
+    return html.escape(str(t or ""), quote=False)
 
 
 def _clean_text(t: str) -> str:
@@ -485,6 +588,75 @@ def _short_text(t: str, *, max_sentences: int = 2, max_chars: int = 500) -> str:
     if len(out) > max_chars:
         out = out[:max_chars].rstrip(" ,.;:—-") + "…"
     return out
+
+
+def _plural_components(n: int) -> str:
+    """«1 компонент», «3 компонента», «14 компонентов»."""
+    tail = n % 100
+    if 11 <= tail <= 14:
+        word = "компонентов"
+    else:
+        last = n % 10
+        if last == 1:
+            word = "компонент"
+        elif 2 <= last <= 4:
+            word = "компонента"
+        else:
+            word = "компонентов"
+    return f"{n} {word}"
+
+
+def _plural_questions(n: int) -> str:
+    """«1 вопрос», «3 вопроса», «5 вопросов»."""
+    tail = n % 100
+    if 11 <= tail <= 14:
+        word = "вопросов"
+    else:
+        last = n % 10
+        if last == 1:
+            word = "вопрос"
+        elif 2 <= last <= 4:
+            word = "вопроса"
+        else:
+            word = "вопросов"
+    return f"{n} {word}"
+
+
+# У Telegram жёсткий предел 4096 символов на сообщение. Карточка большой
+# группы с пояснениями по каждому компоненту может в него не влезть.
+TELEGRAM_LIMIT = 4000
+
+
+def _split_message(text: str, limit: int = TELEGRAM_LIMIT) -> List[str]:
+    """Режет длинный текст по границам абзацев, не разрывая строки."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        # Отдельный абзац длиннее лимита — режем жёстко, иначе Telegram откажет.
+        while len(block) > limit:
+            chunks.append(block[:limit])
+            block = block[limit:]
+        current = block
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _answer_long(message: Message, text: str, **kwargs: Any) -> None:
+    """Клавиатуру вешаем на последний кусок, чтобы кнопки были внизу."""
+    parts = _split_message(text)
+    for part in parts[:-1]:
+        await message.answer(part)
+    await message.answer(parts[-1], **kwargs)
 
 
 def build_doctor_cta_footer() -> str:
@@ -511,7 +683,7 @@ def build_step1_brief_message(data: Dict[str, Any]) -> str:
             "",
             "<b>Состав не найден</b> 🤍",
             "",
-            f"🧴 <b>{product_name}</b>",
+            f"🧴 <b>{_esc(product_name)}</b>",
             "",
             DIVIDER_LIGHT,
             "",
@@ -535,7 +707,7 @@ def build_step1_brief_message(data: Dict[str, Any]) -> str:
         "",
         RISK_LABELS.get(risk_level, RISK_LABELS["none"]),
         "",
-        f"🧴 <b>{product_name}</b>",
+        f"🧴 <b>{_esc(product_name)}</b>",
         "",
         DIVIDER_LIGHT,
         "",
@@ -556,7 +728,7 @@ def build_composition_message(data: Dict[str, Any]) -> str:
         "",
         "<b>Состав</b> 🫧",
         "",
-        f"🧴 <b>{product_name}</b>",
+        f"🧴 <b>{_esc(product_name)}</b>",
         "",
         DIVIDER_LIGHT,
         "",
@@ -575,7 +747,7 @@ def build_composition_message(data: Dict[str, Any]) -> str:
             is_cond = bool(ing.get("is_conditional"))
             if is_hard or is_cond:
                 mark = _mark_for_component(is_hard, is_cond)
-                lines.append(f"{mark} {idx}. {name}")
+                lines.append(f"{mark} {idx}. {_esc(name)}")
         lines.append("")
         lines.append(DIVIDER_LIGHT)
         lines.append("")
@@ -587,7 +759,7 @@ def build_composition_message(data: Dict[str, Any]) -> str:
         if not name:
             continue
         mark = _mark_for_component(bool(ing.get("is_hard")), bool(ing.get("is_conditional")))
-        lines.append(f"{mark} {idx}. {name}")
+        lines.append(f"{mark} {idx}. {_esc(name)}")
 
     lines.append("")
     lines.append(DIVIDER_LIGHT)
@@ -627,7 +799,7 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
     ]
 
     if product_name:
-        lines.append(f"🧴 <b>{product_name}</b>")
+        lines.append(f"🧴 <b>{_esc(product_name)}</b>")
     if risk_level:
         lines.append(f"🏷️ Уровень риска: <b>{RISK_SHORT.get(risk_level, '⚪️ не выявлен')}</b>")
 
@@ -638,7 +810,7 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
     if summary:
         lines.append("<b>Коротко о результате</b> 🤍")
         lines.append("")
-        lines.append(summary)
+        lines.append(_esc(summary))
         lines.append("")
         lines.append(DIVIDER_LIGHT)
         lines.append("")
@@ -660,9 +832,9 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
             mark = _mark_for_component(is_hard, is_cond)
 
             pos_txt = f" (№{pos})" if isinstance(pos, int) else ""
-            lines.append(f"{mark} <b>{name}{pos_txt}</b>")
+            lines.append(f"{mark} <b>{_esc(name)}{pos_txt}</b>")
             if note:
-                lines.append(note)
+                lines.append(_esc(note))
             lines.append("")
 
         while lines and lines[-1] == "":
@@ -674,18 +846,18 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
     if overall and not summary:
         lines.append("<b>Общая оценка</b> 🌸")
         lines.append("")
-        lines.append(overall)
+        lines.append(_esc(overall))
         lines.append("")
         lines.append(DIVIDER_LIGHT)
         lines.append("")
 
     if recs:
-        lines.append("<b>Рекомендации</b> ✨")
+        lines.append("<b>Что это значит на практике</b> ✨")
         lines.append("")
         for r in recs[:5]:
-            rr = _short_text(str(r), max_sentences=2, max_chars=240)
+            rr = _short_text(str(r), max_sentences=3, max_chars=400)
             if rr:
-                lines.append(f"• {rr}")
+                lines.append(f"• {_esc(rr)}")
                 lines.append("")
 
         while lines and lines[-1] == "":
@@ -694,9 +866,153 @@ def build_step2_message(step2_data: Dict[str, Any], product_name: Optional[str] 
         lines.append(DIVIDER_LIGHT)
         lines.append("")
 
-    lines.append(build_doctor_cta_footer())
+    # Если вопросы врачу есть — ведём к ним живым переходом, а не сухим
+    # дисклеймером: он примелькался и его перестают замечать.
+    questions = step2_data.get("doctor_questions") or []
+    if questions:
+        lines.append("💭 <i>Это разбор состава, а не консультация: как отреагирует "
+                     "именно твоя кожа, зависит от того, чего бот не знает.</i>")
+        lines.append("")
+        lines.append("👇 Собрала, что стоит спросить у дерматолога именно "
+                     f"по этому составу — <b>{_plural_questions(len(questions[:3]))}</b>.")
+        lines.append("")
+        lines.append(DIVIDER_ACCENT)
+    else:
+        lines.append(build_doctor_cta_footer())
 
     return "\n".join(lines).strip() or "Не удалось сформировать пояснение."
+
+
+def build_groups_message(data: Dict[str, Any], ingredients_data: Dict[str, Any]) -> str:
+    """Экран выбора группы: сколько всего компонентов и что отмечено."""
+    product_name = data.get("product_name") or "Продукт"
+    ingredients = data.get("ingredients") or []
+    groups = ingredients_data.get("groups") or []
+
+    total = sum(len(g.get("items") or []) for g in groups)
+    hard = sum(1 for ing in ingredients if ing.get("is_hard"))
+    cond = sum(1 for ing in ingredients if ing.get("is_conditional"))
+
+    lines = [
+        DIVIDER_ACCENT,
+        "",
+        "<b>Что делает каждый компонент</b> 🧩",
+        "",
+        f"🧴 <b>{_esc(product_name)}</b>",
+        f"🧾 {_plural_components(total)} — разложены по назначению",
+        "",
+        DIVIDER_LIGHT,
+        "",
+        "Выбери группу — внутри пояснение по каждому компоненту: что это, "
+        "зачем он в формуле и о чём говорит его позиция в списке.",
+        "",
+    ]
+
+    if hard or cond:
+        marks = []
+        if hard:
+            marks.append(f"🔴 {hard} — выраженная комедогенность")
+        if cond:
+            marks.append(f"🟠 {cond} — условная")
+        lines.append("Отмечено: " + ", ".join(marks) + ".")
+        lines.append("")
+
+    lines.append(DIVIDER_LIGHT)
+
+    return "\n".join(lines).strip()
+
+
+def build_group_card_message(
+    data: Dict[str, Any], group: Dict[str, Any]
+) -> str:
+    """Карточка одной группы: построчное пояснение по её компонентам."""
+    product_name = data.get("product_name") or "Продукт"
+    key = group.get("key") or ""
+    items = group.get("items") or []
+
+    lines = [
+        DIVIDER_ACCENT,
+        "",
+        f"<b>{group_label(key)}</b>",
+        "",
+        f"🧴 <b>{_esc(product_name)}</b>",
+        f"🧾 {_plural_components(len(items))} в этой группе",
+        "",
+        DIVIDER_LIGHT,
+        "",
+    ]
+
+    for item in items:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        typ = (item.get("type") or "").strip().lower()
+        mark = _mark_for_component(typ == "hard", typ == "conditional")
+        pos = item.get("position")
+        pos_txt = f" · №{pos}" if isinstance(pos, int) else ""
+
+        lines.append(f"{mark} <b>{_esc(name)}</b>{pos_txt}")
+        note = _clean_text(item.get("note") or "")
+        if note:
+            lines.append(_esc(note))
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    lines.append("")
+    lines.append(DIVIDER_LIGHT)
+
+    return "\n".join(lines).strip()
+
+
+def build_doctor_questions_message(
+    data: Dict[str, Any], questions: Sequence[str]
+) -> str:
+    """Экран с вопросами врачу — то, ради чего затевалась вся навигация."""
+    product_name = data.get("product_name") or "Продукт"
+
+    lines = [
+        DIVIDER_ACCENT,
+        "",
+        "<b>Что спросить у врача</b> ❓",
+        "",
+        f"🧴 <b>{_esc(product_name)}</b>",
+        "",
+        DIVIDER_LIGHT,
+        "",
+        "Состав я разобрала. Но подойдёт ли средство <b>именно твоей коже</b> — "
+        "зависит от того, чего я знать не могу: типа кожи и состояния барьера, "
+        "остального ухода, назначенных препаратов, сезона и планов.",
+        "",
+        "Об этом стоит спросить живого дерматолога. Вот вопросы, собранные "
+        "по этому конкретному составу 👇",
+        "",
+    ]
+
+    numerals = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    for idx, q in enumerate(questions[:5]):
+        qq = _clean_text(str(q))
+        if not qq:
+            continue
+        lines.append(f"{numerals[idx]} {_esc(qq)}")
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    lines.extend([
+        "",
+        DIVIDER_LIGHT,
+        "",
+        "🩵 <b>Лиза Дубинская</b> — дерматолог.",
+        "Можно написать напрямую и показать этот разбор: с ним на приёме "
+        "будет предметнее, чем с фотографией баночки.",
+        "",
+        DIVIDER_ACCENT,
+    ])
+
+    return "\n".join(lines).strip()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1155,17 +1471,25 @@ async def _run_step2_background(
 ) -> None:
     t0 = time.monotonic()
     key = step2_cache_key(step1_data)
+
+    async def _deliver(step2_data: Dict[str, Any]) -> None:
+        """Отправляет шаг 2 и оставляет разбор доступным для кнопок."""
+        _slot_put(token, "step2", step2_data)
+        questions = step2_data.get("doctor_questions") or []
+        await bot.send_message(
+            chat_id,
+            build_step2_message(
+                step2_data,
+                product_name=step1_data.get("product_name"),
+                risk_level=step1_data.get("risk_level"),
+            ),
+            reply_markup=_build_step2_keyboard(token, has_questions=bool(questions)),
+        )
+
     try:
         cached = await analytics.cache_get(key)
         if cached:
-            await bot.send_message(
-                chat_id,
-                build_step2_message(
-                    cached,
-                    product_name=step1_data.get("product_name"),
-                    risk_level=step1_data.get("risk_level"),
-                ),
-            )
+            await _deliver(cached)
             await analytics.track(
                 kind="step2", user=user, chat_id=chat_id, cached=True,
                 product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
@@ -1189,14 +1513,7 @@ async def _run_step2_background(
             )
             return
 
-        await bot.send_message(
-            chat_id,
-            build_step2_message(
-                step2_json,
-                product_name=step1_data.get("product_name"),
-                risk_level=step1_data.get("risk_level"),
-            ),
-        )
+        await _deliver(step2_json)
         await analytics.cache_put(key, "step2", step2_json)
         await analytics.track(
             kind="step2", user=user, chat_id=chat_id,
@@ -1218,7 +1535,10 @@ async def _run_step2_background(
             detail=f"{type(e).__name__}: {e}",
         )
     finally:
-        _cache_del(token)
+        # Раньше здесь удалялся весь токен: шаг 2 был последним экраном.
+        # Теперь с него уходят дальше — в разбор состава и к вопросам врачу,
+        # поэтому снимаем только замок «уже считаю», а разбор оставляем жить.
+        STEP2_INFLIGHT.pop(token, None)
 
 
 async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
@@ -1243,6 +1563,182 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
 
     chat_id = cb.message.chat.id
     asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token, cb.from_user))
+
+
+# ─────────────────────────────────────────────────────────────
+# Разбор состава по группам
+# ─────────────────────────────────────────────────────────────
+
+STALE_BUTTON = "Эта кнопка уже неактуальна. Отправь запрос заново."
+
+
+def _doctor_questions(token: str) -> List[str]:
+    step2 = _slot_get(token, "step2") or {}
+    return [q for q in (step2.get("doctor_questions") or []) if str(q).strip()]
+
+
+def ingredients_cache_key(step1_data: Dict[str, Any]) -> str:
+    payload = build_ingredients_payload(step1_data)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "ing:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+async def _load_ingredients(
+    step1_data: Dict[str, Any], token: str, user: Any = None, chat_id: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """Разбор состава: сначала память, потом SQLite, и только затем модель."""
+    ready = _slot_get(token, "ingredients")
+    if ready:
+        return ready
+
+    t0 = time.monotonic()
+    key = ingredients_cache_key(step1_data)
+
+    cached = await analytics.cache_get(key)
+    if cached:
+        _slot_put(token, "ingredients", cached)
+        await analytics.track(
+            kind="ingredients", user=user, chat_id=chat_id, cached=True,
+            product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        return cached
+
+    result = await run_agent_ingredients_ex(step1_data)
+    data = _parse_agent_json(result.raw)
+    usage = result.usage
+
+    if not data or not data.get("groups"):
+        await analytics.track(
+            kind="ingredients", user=user, chat_id=chat_id, status="error",
+            product=step1_data.get("product_name"),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            model=usage.model, in_tokens=usage.in_tokens, cached_tokens=usage.cached_tokens,
+            out_tokens=usage.out_tokens, tool_calls=usage.tool_calls,
+            detail="разбор состава вернул пусто",
+        )
+        return None
+
+    _slot_put(token, "ingredients", data)
+    await analytics.cache_put(key, "ingredients", data)
+    await analytics.track(
+        kind="ingredients", user=user, chat_id=chat_id,
+        product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
+        latency_ms=int((time.monotonic() - t0) * 1000),
+        model=usage.model, in_tokens=usage.in_tokens, cached_tokens=usage.cached_tokens,
+        out_tokens=usage.out_tokens, tool_calls=usage.tool_calls,
+    )
+    return data
+
+
+async def handle_groups_callback(cb: CallbackQuery):
+    payload = cb.data or ""
+    if not payload.startswith("groups:"):
+        return
+
+    token = payload.split(":", 1)[1]
+    step1_data = _cache_get(token)
+    if not step1_data or cb.message is None:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    if not config.INGREDIENTS_ENABLED:
+        await cb.answer("Разбор состава сейчас недоступен.", show_alert=True)
+        return
+
+    ready = _slot_get(token, "ingredients")
+    if not ready:
+        if token in INGREDIENTS_INFLIGHT:
+            await cb.answer("Уже разбираю состав.", show_alert=False)
+            return
+        INGREDIENTS_INFLIGHT[token] = time.time()
+        await cb.answer()
+        await cb.message.answer(PROCESSING_INGREDIENTS)
+    else:
+        await cb.answer()
+
+    try:
+        data = await _load_ingredients(
+            step1_data, token, user=cb.from_user, chat_id=cb.message.chat.id
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("INGREDIENTS ERROR: %s", exc, exc_info=True)
+        data = None
+    finally:
+        INGREDIENTS_INFLIGHT.pop(token, None)
+
+    if not data:
+        await cb.message.answer(ERROR_INGREDIENTS)
+        return
+
+    await cb.message.answer(
+        build_groups_message(step1_data, data),
+        reply_markup=_build_groups_keyboard(
+            token, data.get("groups") or [], has_questions=bool(_doctor_questions(token))
+        ),
+    )
+
+
+async def handle_group_card_callback(cb: CallbackQuery):
+    payload = cb.data or ""
+    if not payload.startswith("grp:"):
+        return
+
+    parts = payload.split(":", 2)
+    if len(parts) < 3:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    _, token, group_key = parts
+    step1_data = _cache_get(token)
+    data = _slot_get(token, "ingredients")
+    if not step1_data or not data or cb.message is None:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    group = next(
+        (g for g in (data.get("groups") or []) if g.get("key") == group_key), None
+    )
+    if not group:
+        await cb.answer("Такой группы в этом составе нет.", show_alert=True)
+        return
+
+    await cb.answer()
+    await _answer_long(
+        cb.message,
+        build_group_card_message(step1_data, group),
+        reply_markup=_build_group_card_keyboard(
+            token, has_questions=bool(_doctor_questions(token))
+        ),
+    )
+    await analytics.track(
+        kind="group", user=cb.from_user, chat_id=cb.message.chat.id,
+        product=step1_data.get("product_name"), detail=group_key,
+    )
+
+
+async def handle_doctor_callback(cb: CallbackQuery):
+    payload = cb.data or ""
+    if not payload.startswith("doc:"):
+        return
+
+    token = payload.split(":", 1)[1]
+    step1_data = _cache_get(token)
+    questions = _doctor_questions(token)
+    if not step1_data or not questions or cb.message is None:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+
+    await cb.answer()
+    await _answer_long(
+        cb.message,
+        build_doctor_questions_message(step1_data, questions),
+        reply_markup=_build_doctor_keyboard(token),
+    )
+    await analytics.track(
+        kind="doctor", user=cb.from_user, chat_id=cb.message.chat.id,
+        product=step1_data.get("product_name"), risk=step1_data.get("risk_level"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1292,6 +1788,9 @@ async def _main_async():
 
     dp.callback_query.register(handle_composition_callback, F.data.startswith("composition:"))
     dp.callback_query.register(handle_step2_callback, F.data.startswith("step2:"))
+    dp.callback_query.register(handle_groups_callback, F.data.startswith("groups:"))
+    dp.callback_query.register(handle_group_card_callback, F.data.startswith("grp:"))
+    dp.callback_query.register(handle_doctor_callback, F.data.startswith("doc:"))
 
     logger.info("CreamcheckBot started (FINAL BALANCED UX)")
 

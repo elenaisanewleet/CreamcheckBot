@@ -283,16 +283,26 @@ def test_step2_renders_and_caches(monkeypatch):
     assert fb2.messages[0] == fb.messages[0]
 
 
-def test_step2_token_is_released(monkeypatch):
+def test_step2_releases_lock_but_keeps_token(monkeypatch):
+    """После шага 2 замок снимается, а разбор остаётся: с него уходят дальше.
+
+    Раньше токен здесь удалялся — шаг 2 был последним экраном. Теперь на нём
+    висят кнопки «Что делает каждый компонент» и «Что спросить у врача»,
+    и удаление токена сломало бы их сразу после отправки сообщения.
+    """
     async def _run2(step1_payload):
         return AgentResult(raw=json.dumps(STEP2_JSON), usage=Usage())
 
     monkeypatch.setattr(botmod, "run_agent_step2_ex", _run2)
-    token = botmod._cache_put({"product_name": "X", "ingredients": []})
+    step1 = {"product_name": "X", "ingredients": []}
+    token = botmod._cache_put(step1)
     botmod.STEP2_INFLIGHT[token] = 1.0
-    run(botmod._run_step2_background(FakeBot(), 1, {"product_name": "X", "ingredients": []}, token))
-    assert token not in botmod.STEP2_CACHE
+    run(botmod._run_step2_background(FakeBot(), 1, step1, token))
+
     assert token not in botmod.STEP2_INFLIGHT
+    assert botmod._cache_get(token) == step1
+    # Результат шага 2 сохранён — кнопкам есть на что опереться.
+    assert botmod._slot_get(token, "step2") == STEP2_JSON
 
 
 def test_expired_tokens_are_swept():

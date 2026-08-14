@@ -149,6 +149,15 @@ STEP2_MAX_TOOL_CALLS: int = env_int("STEP2_MAX_TOOL_CALLS", 3)
 STEP2_MAX_OUTPUT_TOKENS: int = env_int("STEP2_MAX_OUTPUT_TOKENS", 1200)
 STEP2_REASONING_EFFORT: str = env_str("STEP2_REASONING_EFFORT", "").lower()
 
+# Разбор состава по группам («Что внутри»). Считается лениво — только когда
+# человек нажал кнопку, — и после этого кэшируется наравне с остальными шагами.
+# Выход крупный: пояснение по каждому из 25–45 компонентов.
+INGREDIENTS_ENABLED: bool = env_bool("INGREDIENTS_ENABLED", True)
+INGREDIENTS_WEB_SEARCH: bool = env_bool("INGREDIENTS_WEB_SEARCH", True)
+INGREDIENTS_MAX_TOOL_CALLS: int = env_int("INGREDIENTS_MAX_TOOL_CALLS", 4)
+INGREDIENTS_MAX_OUTPUT_TOKENS: int = env_int("INGREDIENTS_MAX_OUTPUT_TOKENS", 4000)
+INGREDIENTS_REASONING_EFFORT: str = env_str("INGREDIENTS_REASONING_EFFORT", "").lower()
+
 # Ключ prompt-кэша OpenAI: одинаковый префикс промпта переиспользуется дешевле.
 PROMPT_CACHE_KEY: str = env_str("PROMPT_CACHE_KEY", "creamcheck")
 
@@ -169,6 +178,10 @@ RATE_LIMIT_PER_HOUR: int = env_int("RATE_LIMIT_PER_HOUR", 0)
 
 # Максимальная длина текстового запроса (защита от «простыней» в промпте)
 MAX_QUERY_LEN: int = env_int("MAX_QUERY_LEN", 300)
+
+# Телеграм-ник дерматолога: на него ведёт кнопка «Записаться на консультацию».
+# Без «собачки» — она добавляется там, где нужна.
+DOCTOR_USERNAME: str = env_str("DOCTOR_USERNAME", "DrDubinsky").lstrip("@")
 
 
 # ─────────────────────────────────────────────────────────────
