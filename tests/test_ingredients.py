@@ -14,6 +14,7 @@ import pytest
 
 from agent.agent import (
     _assemble_groups,
+    _strip_citations,
     _parse_ingredients_marked_text,
     _parse_step2_marked_text_v2,
     build_ingredients_payload,
@@ -155,6 +156,43 @@ def test_unknown_confidence_is_dropped():
     """Чужое значение src не должно попадать дальше как признак достоверности."""
     parsed = _parse_ingredients_marked_text("- 1 | grp=tex | src=абсолютно | note=Вода.")
     assert parsed[1]["src"] == ""
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Реальные строки из прогона на CeraVe: модель с веб-поиском дописывает
+        # сноски markdown прямо в текст, который читает человек.
+        (
+            "Липид барьера; описывают антимикробные свойства. "
+            "([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/28109750/?utm_source=openai))",
+            "Липид барьера; описывают антимикробные свойства.",
+        ),
+        (
+            "Неионогенный эмульгатор. "
+            "([cosmileeurope.eu](https://cosmileeurope.eu/inci/detail/4865/x/?utm_source=openai))",
+            "Неионогенный эмульгатор.",
+        ),
+        ("Голая ссылка https://example.com/foo?bar=1 внутри.", "Голая ссылка внутри."),
+        ("Смотри https://example.com. Дальше.", "Смотри. Дальше."),
+        ("Текст без сносок не меняется.", "Текст без сносок не меняется."),
+        ("Доля <1% и знак & остаются.", "Доля <1% и знак & остаются."),
+        ("", ""),
+    ],
+)
+def test_citations_are_stripped(raw, expected):
+    assert _strip_citations(raw) == expected
+
+
+def test_parser_strips_citations_from_note_and_ask():
+    parsed = _parse_ingredients_marked_text(
+        "- 18 | grp=activ | src=web "
+        "| note=Липид барьера. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/1/?utm_source=openai)) "
+        "| ask=Твой ли это случай? (https://example.com)"
+    )
+    assert parsed[18]["note"] == "Липид барьера."
+    assert parsed[18]["ask"] == "Твой ли это случай?"
+    assert "http" not in json.dumps(parsed, ensure_ascii=False)
 
 
 def test_pipe_inside_note_does_not_eat_the_tail():
@@ -513,6 +551,36 @@ def test_step2_without_doctor_block_is_still_valid():
 def test_step2_keyboard_hides_doctor_without_questions():
     assert botmod.BTN_DOCTOR in buttons(botmod._build_step2_keyboard("t", has_questions=True))
     assert botmod.BTN_DOCTOR not in buttons(botmod._build_step2_keyboard("t", has_questions=False))
+
+
+def test_doctor_is_named_on_every_screen():
+    """Лиза должна быть названа по имени на каждом экране, а не «дерматолог вообще».
+
+    Безымянный врач читается как абстракция и не конвертирует; плюс имя
+    сразу снимает вопрос, к кому именно идти.
+    """
+    screens = {
+        "шаг 1": botmod.build_step1_brief_message(STEP1),
+        "состав": botmod.build_composition_message(STEP1),
+        "группы": botmod.build_groups_message(STEP1, INGREDIENTS_DATA),
+        "карточка группы": botmod.build_group_card_message(STEP1, GROUP_WITH_QUESTIONS),
+        "карточка без вопросов": botmod.build_group_card_message(
+            STEP1, INGREDIENTS_DATA["groups"][0]
+        ),
+        "вопросы по группе": botmod.build_group_questions_message(
+            STEP1, GROUP_WITH_QUESTIONS
+        ),
+        "вопросы врачу": botmod.build_doctor_questions_message(
+            STEP1, STEP2_WITH_QUESTIONS["doctor_questions"]
+        ),
+        "подробнее": botmod.build_step2_message(STEP2_WITH_QUESTIONS, product_name="X"),
+    }
+    for name, text in screens.items():
+        assert ("Лиз" in text) or ("DrDubinsky" in text), f"на экране «{name}» врача не видно"
+
+
+def test_doctor_button_names_her():
+    assert "Лизу" in botmod.BTN_DOCTOR_DIRECT
 
 
 def test_every_screen_offers_the_doctor(monkeypatch):
