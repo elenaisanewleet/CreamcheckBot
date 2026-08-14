@@ -13,7 +13,10 @@ import re
 import pytest
 
 from agent.agent import (
+    INGREDIENT_FIELDS,
+    SYSTEM_PROMPT_INGREDIENTS,
     _assemble_groups,
+    build_ingredients_prompt,
     _strip_citations,
     _parse_ingredients_marked_text,
     _parse_step2_marked_text_v2,
@@ -794,3 +797,48 @@ def test_agent_failure_tells_the_user(monkeypatch):
 
     assert botmod.ERROR_INGREDIENTS in cb.message.sent[-1].text
     assert token not in botmod.INGREDIENTS_INFLIGHT  # замок снят, можно повторить
+
+
+# ─────────────────────────────────────────────────────────────
+# Контракт запроса: что просим — то и умеем разобрать
+# ─────────────────────────────────────────────────────────────
+
+_FORMAT_LINE = re.compile(r"^-\s*<номер>.*$", re.M)
+
+
+def _fields_in_format_line(text: str) -> set:
+    """Поля, перечисленные в шаблоне строки `- <номер> | … = …`."""
+    line = _FORMAT_LINE.search(text)
+    assert line, "в тексте нет шаблона строки ответа"
+    return set(re.findall(r"\b(grp|src|note|ask)\s*=", line.group(0)))
+
+
+def test_request_asks_for_every_field_the_parser_understands():
+    """Запрос обязан просить все поля, которые парсер потом ищет.
+
+    Пока в запросе перечислялись только grp и note, модель ровно их и
+    присылала: src=thin не приходил почти никогда, а ask пропадал целиком
+    на составах без отмеченных комедогенов.
+    """
+    prompt = build_ingredients_prompt(build_ingredients_payload(STEP1))
+    for field in INGREDIENT_FIELDS:
+        assert f"{field}=" in prompt, f"поле {field} не запрошено у модели"
+
+
+def test_request_format_line_matches_system_prompt():
+    """Два шаблона в одном разговоре не должны противоречить друг другу.
+
+    Системный промпт объявляет четыре поля. Если запрос объявляет меньше,
+    модель верит запросу — он ближе и конкретнее.
+    """
+    assert _fields_in_format_line(
+        build_ingredients_prompt(build_ingredients_payload(STEP1))
+    ) == _fields_in_format_line(SYSTEM_PROMPT_INGREDIENTS)
+
+
+def test_request_carries_marks_and_numbers():
+    """Номера и пометки комедогенности ставит код, а не модель."""
+    prompt = build_ingredients_prompt(build_ingredients_payload(STEP1))
+    assert "3. Petrolatum [отмечен как комедоген]" in prompt
+    assert "4. Dimethicone [условно-комедогенный]" in prompt
+    assert "1. Aqua\n" in prompt
