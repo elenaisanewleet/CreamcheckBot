@@ -208,6 +208,33 @@ def test_comedogen_type_comes_from_code_not_model():
     assert petrolatum["type"] == "hard"
 
 
+def test_model_cannot_invent_ingredients_or_groups():
+    """Даже если модель «поедет», состав и группы остаются под контролем кода.
+
+    Имена берутся из данных шага 1, а не из ответа модели: модель отвечает
+    только номерами. Поэтому выдуманный ингредиент физически некуда положить,
+    а незнакомый ключ группы схлопывается в «Остальное».
+    """
+    step1 = {"product_name": "X", "ingredients": [
+        {"name": "Aqua", "is_hard": False, "is_conditional": False},
+        {"name": "Glycerin", "is_hard": False, "is_conditional": False},
+    ]}
+    rogue = (
+        "- 1 | grp=tex | note=Вода.\n"
+        "- 2 | grp=humec | note=Глицерин.\n"
+        "- 3 | grp=emol | note=ВЫДУМАННОЕ МАСЛО, КОТОРОГО НЕТ В СОСТАВЕ\n"
+        "- 99 | grp=магия | note=И ещё одно\n"
+    )
+    result = _assemble_groups(
+        build_ingredients_payload(step1), _parse_ingredients_marked_text(rogue)
+    )
+
+    names = [it["name"] for g in result["groups"] for it in g["items"]]
+    assert sorted(names) == ["Aqua", "Glycerin"]
+    assert all(g["key"] in GROUP_ORDER for g in result["groups"])
+    assert "ВЫДУМАННОЕ" not in json.dumps(result, ensure_ascii=False)
+
+
 def test_empty_composition_yields_no_groups():
     payload = build_ingredients_payload({"product_name": "X", "ingredients": []})
     assert _assemble_groups(payload, {})["groups"] == []
