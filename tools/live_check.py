@@ -49,7 +49,14 @@ def mentions_composition(rec: str, names: list[str]) -> bool:
     """
     low = rec.lower()
     for name in names:
-        parts = [p for p in re.split(r"[\s/&-]+", name.lower()) if len(p) > 4]
+        # Сначала имя целиком: у коротких INCI («Zinc PCA», «Urea») ни одного
+        # куска длиннее четырёх букв нет, и по кускам они не находились никогда —
+        # проверка объявляла общим местом рекомендацию, где компонент назван
+        # прямым текстом.
+        whole = name.strip().lower()
+        if whole and whole in low:
+            return True
+        parts = [p for p in re.split(r"[\s/&-]+", whole) if len(p) > 4]
         if any(p in low for p in parts):
             return True
     return bool(re.search(r"\b(позици|перв|втор|треть|четвёрт|пят)\w*", low))

@@ -37,6 +37,7 @@ from aiogram.types import (
 )
 
 from . import admin, analytics, config, dashboard
+from .tg import never_silent, quiet
 from .config import TELEGRAM_BOT_TOKEN
 from agent.agent import (
     build_ingredients_payload,
@@ -171,6 +172,11 @@ PROCESSING_INGREDIENTS = "🫧 Разбираю состав по компоне
 ERROR_INGREDIENTS = "Не удалось разобрать состав по компонентам. Попробуй ещё раз."
 ERROR_GENERAL = "Не удалось обработать запрос. Попробуй ещё раз или отправь другое фото."
 ERROR_EMPTY = "Отправь фото средства или напиши его название."
+UNKNOWN_COMMAND_MESSAGE = (
+    "Такой команды у меня нет 🤍\n\n"
+    "Отправь фото средства или напиши его название — этого достаточно. "
+    "Что я умею, показывает /help."
+)
 BUSY_MESSAGE = "🫧 Ещё разбираю предыдущий запрос — отвечу через несколько секунд."
 TOO_LONG_MESSAGE = "Напиши покороче: бренд и название продукта — этого достаточно 🤍"
 
@@ -1484,7 +1490,14 @@ async def handle_text(msg: Message, bot: Bot):
     if not text:
         return await msg.answer(ERROR_EMPTY)
 
+    # Неизвестная команда: раньше здесь был молчаливый выход, и человек,
+    # ошибившийся в букве, получал ту же тишину, что и на сломанном фото.
     if text.startswith("/"):
+        await msg.answer(UNKNOWN_COMMAND_MESSAGE)
+        await analytics.track(
+            kind="blocked", user=msg.from_user, chat_id=msg.chat.id,
+            status="unknown_command", source="text", detail=text[:64],
+        )
         return
 
     if len(text) > config.MAX_QUERY_LEN:
@@ -1512,6 +1525,7 @@ async def handle_text(msg: Message, bot: Bot):
 # Кнопки
 # ─────────────────────────────────────────────────────────────
 
+@never_silent(ERROR_GENERAL)
 async def handle_composition_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("composition:"):
@@ -1523,7 +1537,7 @@ async def handle_composition_callback(cb: CallbackQuery):
         await cb.answer("Эта кнопка уже неактуальна. Отправь запрос заново.", show_alert=True)
         return
 
-    await cb.answer()
+    await quiet(cb.answer())
 
     t0 = time.monotonic()
     # Ссылку-источник проверяем здесь (обычно уже прогрета в фоне и это мгновенно)
@@ -1623,6 +1637,7 @@ async def _run_step2_background(
         STEP2_INFLIGHT.pop(token, None)
 
 
+@never_silent(ERROR_GENERAL)
 async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
     payload = cb.data or ""
     if not payload.startswith("step2:"):
@@ -1638,13 +1653,17 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
         await cb.answer("Уже формирую ответ.", show_alert=False)
         return
 
+    # Замок ставим до первого await, но снимаем при любом сбое: иначе кнопка
+    # до конца жизни токена отвечает «Уже формирую ответ» и не присылает ничего.
     STEP2_INFLIGHT[token] = time.time()
-
-    await cb.answer()
-    await cb.message.answer(PROCESSING_STEP2)
-
-    chat_id = cb.message.chat.id
-    asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token, cb.from_user))
+    try:
+        await quiet(cb.answer())
+        await quiet(cb.message.answer(PROCESSING_STEP2))
+        chat_id = cb.message.chat.id
+        asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token, cb.from_user))
+    except BaseException:
+        STEP2_INFLIGHT.pop(token, None)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1713,6 +1732,7 @@ async def _load_ingredients(
     return data
 
 
+@never_silent(ERROR_GENERAL)
 async def handle_groups_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("groups:"):
@@ -1733,13 +1753,14 @@ async def handle_groups_callback(cb: CallbackQuery):
         if token in INGREDIENTS_INFLIGHT:
             await cb.answer("Уже разбираю состав.", show_alert=False)
             return
+        # Замок и try/finally вплотную: между ними не должно быть ни одного
+        # await, иначе сбой отправки оставит кнопку запертой навсегда.
         INGREDIENTS_INFLIGHT[token] = time.time()
-        await cb.answer()
-        await cb.message.answer(PROCESSING_INGREDIENTS)
-    else:
-        await cb.answer()
 
     try:
+        await quiet(cb.answer())
+        if not ready:
+            await quiet(cb.message.answer(PROCESSING_INGREDIENTS))
         data = await _load_ingredients(
             step1_data, token, user=cb.from_user, chat_id=cb.message.chat.id
         )
@@ -1761,6 +1782,7 @@ async def handle_groups_callback(cb: CallbackQuery):
     )
 
 
+@never_silent(ERROR_GENERAL)
 async def handle_group_card_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("grp:"):
@@ -1785,7 +1807,7 @@ async def handle_group_card_callback(cb: CallbackQuery):
         await cb.answer("Такой группы в этом составе нет.", show_alert=True)
         return
 
-    await cb.answer()
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_group_card_message(step1_data, group),
@@ -1799,6 +1821,7 @@ async def handle_group_card_callback(cb: CallbackQuery):
     )
 
 
+@never_silent(ERROR_GENERAL)
 async def handle_group_questions_callback(cb: CallbackQuery):
     """Вопросы врачу по одной группе — из пометок ask у её компонентов."""
     payload = cb.data or ""
@@ -1824,7 +1847,7 @@ async def handle_group_questions_callback(cb: CallbackQuery):
         await cb.answer("По этой группе вопросов не набралось.", show_alert=True)
         return
 
-    await cb.answer()
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_group_questions_message(step1_data, group),
@@ -1836,6 +1859,7 @@ async def handle_group_questions_callback(cb: CallbackQuery):
     )
 
 
+@never_silent(ERROR_GENERAL)
 async def handle_doctor_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("doc:"):
@@ -1848,7 +1872,7 @@ async def handle_doctor_callback(cb: CallbackQuery):
         await cb.answer(STALE_BUTTON, show_alert=True)
         return
 
-    await cb.answer()
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_doctor_questions_message(step1_data, questions),

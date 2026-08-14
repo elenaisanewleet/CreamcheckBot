@@ -6,8 +6,10 @@ aiogram 3 так себя не ведёт: `msg.answer()` отдаёт объе�
 awaitable, но НЕ корутину. `asyncio.create_task()` на нём падает TypeError,
 и обработчик фото умирал на первой же строке, до любой отправки.
 
-Поэтому здесь фейк намеренно повторяет поведение aiogram. Верните
-create_task вместо ensure_future — эти тесты покраснеют.
+Фейки живут в `tools/tg_fakes.py` — одним набором на все тесты и на живой
+прогон: пока «как ведёт себя aiogram» описано в каждом файле заново,
+описания расходятся и дыра открывается снова. Верните create_task вместо
+ensure_future — эти тесты покраснеют.
 """
 
 import asyncio
@@ -17,6 +19,9 @@ import pytest
 
 from agent.agent import AgentResult, Usage
 from bot import analytics, bot as botmod
+from tools.tg_fakes import FakeBot, FakeMessage, FakeUser
+
+USER = FakeUser()
 
 STEP1_JSON = {
     "product_name": "CeraVe Moisturising Cream",
@@ -27,67 +32,6 @@ STEP1_JSON = {
         {"name": "Glycerin", "is_hard": False, "is_conditional": False},
     ],
 }
-
-
-class SendMessageLike:
-    """Как aiogram 3: awaitable, но не корутина.
-
-    Именно это отличие и не поймали прежние тесты.
-    """
-
-    def __init__(self, sink, text, reply_markup=None):
-        self._sink = sink
-        self.text = text
-        self.reply_markup = reply_markup
-        self.deleted = False
-
-    def __await__(self):
-        async def _send():
-            self._sink.append(self)
-            return self
-
-        return _send().__await__()
-
-    async def delete(self):
-        self.deleted = True
-
-
-class FakeUser:
-    id = 41082373
-    username = "elenaisanewleet"
-    full_name = "Лена"
-
-
-class FakeChat:
-    id = 555
-
-
-class FakePhoto:
-    file_id = "photo-1"
-    file_unique_id = "u1"
-    width = 1280
-    height = 960
-
-
-class FakeMessage:
-    """answer() — обычный метод, возвращающий awaitable-объект, как в aiogram."""
-
-    def __init__(self, *, photo=True, caption=None, media_group_id=None):
-        self.text = None
-        self.caption = caption
-        self.photo = [FakePhoto()] if photo else None
-        self.media_group_id = media_group_id
-        self.from_user = FakeUser()
-        self.chat = FakeChat()
-        self.sent = []
-
-    def answer(self, text, reply_markup=None, **kwargs):
-        return SendMessageLike(self.sent, text, reply_markup)
-
-
-class FakeBot:
-    async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
-        return SendMessageLike([], text, reply_markup)
 
 
 @pytest.fixture(autouse=True)
@@ -129,7 +73,7 @@ def agent_ok(monkeypatch):
 
 def test_single_photo_answers(agent_ok):
     """Главный регресс: на фото бот обязан ответить, а не молчать."""
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
 
     texts = [s.text for s in msg.sent]
@@ -140,13 +84,13 @@ def test_single_photo_answers(agent_ok):
 
 
 def test_status_plate_is_removed_after_answer(agent_ok):
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
     assert msg.sent[0].deleted is True
 
 
 def test_photo_result_has_buttons(agent_ok):
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
     final = msg.sent[-1]
     labels = [b.text for row in final.reply_markup.inline_keyboard for b in row]
@@ -155,15 +99,15 @@ def test_photo_result_has_buttons(agent_ok):
 
 
 def test_caption_is_passed_to_the_model(agent_ok):
-    msg = FakeMessage(caption="CeraVe Moisturising Cream")
+    msg = FakeMessage(photo=True, caption="CeraVe Moisturising Cream")
     run(botmod.handle_photo(msg, FakeBot()))
     assert agent_ok[0]["product_name"] == "CeraVe Moisturising Cream"
 
 
 def test_user_lock_is_released_after_photo(agent_ok):
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
-    assert FakeUser.id not in botmod._ACTIVE_USERS
+    assert USER.id not in botmod._ACTIVE_USERS
 
 
 # ─────────────────────────────────────────────────────────────
@@ -175,11 +119,11 @@ def test_download_failure_tells_the_user(monkeypatch):
         return []
 
     monkeypatch.setattr(botmod, "_collect_images", _empty)
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
 
     assert botmod.ERROR_GENERAL in [s.text for s in msg.sent]
-    assert FakeUser.id not in botmod._ACTIVE_USERS
+    assert USER.id not in botmod._ACTIVE_USERS
 
 
 def test_message_without_photo_is_answered():
@@ -191,9 +135,9 @@ def test_message_without_photo_is_answered():
 def test_second_photo_while_busy_gets_a_reply(agent_ok, monkeypatch):
     """Занятость — тоже ответ, а не тишина."""
     monkeypatch.setattr(botmod.config, "SINGLE_FLIGHT_PER_USER", True)
-    botmod._ACTIVE_USERS[FakeUser.id] = 9e18  # держим замок
+    botmod._ACTIVE_USERS[USER.id] = 9e18  # держим замок
 
-    msg = FakeMessage()
+    msg = FakeMessage(photo=True)
     run(botmod.handle_photo(msg, FakeBot()))
     assert [s.text for s in msg.sent] == [botmod.BUSY_MESSAGE]
 
@@ -204,7 +148,7 @@ def test_second_photo_while_busy_gets_a_reply(agent_ok, monkeypatch):
 
 def test_album_answers_too(agent_ok, monkeypatch):
     monkeypatch.setattr(botmod.config, "ALBUM_WAIT_SEC", 0.01)
-    msg = FakeMessage(media_group_id="album-1")
+    msg = FakeMessage(photo=True, media_group_id="album-1")
 
     async def _flow():
         await botmod.handle_photo(msg, FakeBot())

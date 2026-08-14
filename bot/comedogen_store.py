@@ -219,6 +219,10 @@ async def undo(override_id: int) -> bool:
     if not row:
         return False
     await _write("UPDATE base_overrides SET active = 0 WHERE id = ?", (override_id,))
+    # Сброс кэша — часть правки, а не забота вызывающего: пока про него помнили
+    # админка и дашборд по отдельности, любой третий вход показывал бы людям
+    # вердикты, посчитанные по прежней базе.
+    await _applied()
     return True
 
 

@@ -722,7 +722,11 @@ SRC_KNOWN = "known"
 SRC_THIN = "thin"
 _SRC_VALUES = (SRC_WEB, SRC_KNOWN, SRC_THIN)
 
-_FIELD_RE = re.compile(r"\|\s*(grp|src|note|ask)\s*=", re.I)
+# Поля строки разбора. Список один на всех: по нему собирается регулярка
+# парсера и по нему же проверяется, что запрос к модели просит их все.
+INGREDIENT_FIELDS = ("grp", "src", "note", "ask")
+
+_FIELD_RE = re.compile(r"\|\s*(" + "|".join(INGREDIENT_FIELDS) + r")\s*=", re.I)
 
 # Модель с включённым веб-поиском дописывает к тексту сноски вида
 # «([pubmed.ncbi.nlm.nih.gov](https://pubmed.../?utm_source=openai))».
@@ -823,6 +827,42 @@ def _assemble_groups(
     return {"groups": groups}
 
 
+def build_ingredients_prompt(payload: Dict[str, Any]) -> str:
+    """Пользовательская часть запроса на разбор состава.
+
+    Формат строки здесь обязан совпадать с тем, что объявлен в системном
+    промпте. Раньше не совпадал: тут перечислялись только grp и note, и
+    модель читала последний, самый конкретный шаблон как настоящий.
+    Следствие на живых прогонах — src=thin не приходил почти никогда,
+    а ask пропадал целиком на составах без отмеченных комедогенов
+    (0 вопросов из 11 на The Ordinary, 0 из 10 на Bioderma), потому что
+    только для отмеченных он был потребован системным промптом
+    категорически и переживал противоречие.
+    """
+    numbered = "\n".join(
+        f"{it['n']}. {it['name']}"
+        + (" [отмечен как комедоген]" if it.get("mark") == "hard" else "")
+        + (" [условно-комедогенный]" if it.get("mark") == "conditional" else "")
+        for it in payload["items"]
+    )
+
+    return (
+        f"Продукт: {payload.get('product_name') or 'без названия'}\n\n"
+        f"Состав ({len(payload['items'])} компонентов), номер = позиция в списке INCI:\n"
+        f"{numbered}\n\n"
+        "Разбери каждый номер. По одной строке на компонент, поля через « | »:\n"
+        "- <номер> | grp=<ключ группы> | src=<web|known|thin> | note=<пояснение> | "
+        "ask=<что зависит от человека и на что ответит врач>\n\n"
+        "src=thin ставь честно: если поиск не дал ничего внятного, признание "
+        "«данных мало» ценнее правдоподобной выдумки.\n"
+        "ask нужен там, где вопрос настоящий: у отмеченных комедогенов — "
+        "обязательно, а также у активов, отдушек и аллергенов, у компонентов "
+        "на первых позициях. На воде и загустителях ask не нужен: выдуманный "
+        "вопрос обесценивает настоящие. Состав без единого ask — это пропущенная "
+        "работа, а не спокойный состав: экран «что спросить у врача» остаётся пустым.\n"
+    )
+
+
 async def run_agent_ingredients_ex(step1_payload: Dict[str, Any]) -> AgentResult:
     """Пояснение по каждому компоненту INCI + раскладка по функциональным группам."""
     payload = build_ingredients_payload(step1_payload)
@@ -831,20 +871,7 @@ async def run_agent_ingredients_ex(step1_payload: Dict[str, Any]) -> AgentResult
     if not payload["items"]:
         return AgentResult(raw=json.dumps({"groups": []}, ensure_ascii=False), usage=usage)
 
-    numbered = "\n".join(
-        f"{it['n']}. {it['name']}"
-        + (" [отмечен как комедоген]" if it.get("mark") == "hard" else "")
-        + (" [условно-комедогенный]" if it.get("mark") == "conditional" else "")
-        for it in payload["items"]
-    )
-
-    prompt_text = (
-        f"Продукт: {payload.get('product_name') or 'без названия'}\n\n"
-        f"Состав ({len(payload['items'])} компонентов), номер = позиция в списке INCI:\n"
-        f"{numbered}\n\n"
-        "Разбери каждый номер. По одной строке на компонент:\n"
-        "- <номер> | grp=<ключ группы> | note=<пояснение>\n"
-    )
+    prompt_text = build_ingredients_prompt(payload)
 
     resp, u = await _responses_create(
         model=MODEL,
