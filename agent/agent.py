@@ -261,15 +261,22 @@ def classify_ingredient_strict(name: str, position: int) -> Dict[str, Any]:
     """
     n = _norm(name)
 
+    # Рабочая база = эталон из comedogen_base.py плюс правки врача.
+    # Пока правок нет, здесь ровно эталонные объекты и поведение прежнее.
+    from bot.comedogen_store import effective as _effective_base
+
+    hard_terms, conditional_terms = _effective_base()
+
     # ── HARD: wax special rule (in name)
     #   По умолчанию — как было: только отдельное слово «wax»
     #   (Candelilla Wax → да, Beeswax → нет).
     #   COMEDOGEN_MATCH_V2=true включает поиск внутри слова, как описано в промпте.
-    if "wax" in n and (config.COMEDOGEN_MATCH_V2 or _has_word(n, "wax")):
+    #   Правило подчиняется базе: если «wax» из неё убрали, оно не срабатывает.
+    if "wax" in hard_terms and "wax" in n and (config.COMEDOGEN_MATCH_V2 or _has_word(n, "wax")):
         return {"is_hard": True, "is_conditional": False, "early_conditional": False}
 
     # ── HARD: strict list (with acid derivative exclusion)
-    for term in hard_comedogens:
+    for term in hard_terms:
         t = _norm(term)
 
         # acids: only exact "... acid" entries are allowed as hard
@@ -292,7 +299,7 @@ def classify_ingredient_strict(name: str, position: int) -> Dict[str, Any]:
             return {"is_hard": True, "is_conditional": False, "early_conditional": False}
 
     # ── CONDITIONAL: strict list + partial rules
-    for term, cutoff in conditional_comedogens.items():
+    for term, cutoff in conditional_terms.items():
         t = _norm(term)
 
         # "sil" — match as whole word only (so it doesn't catch "silica").

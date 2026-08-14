@@ -46,7 +46,6 @@ from agent.agent import (
     run_agent_step2_ex,
 )
 from agent.groups import group_label, is_valid_group
-from agent.comedogen_base import hard_comedogens, conditional_comedogens
 
 
 analytics.setup_logging()
@@ -176,34 +175,6 @@ BUSY_MESSAGE = "🫧 Ещё разбираю предыдущий запрос �
 TOO_LONG_MESSAGE = "Напиши покороче: бренд и название продукта — этого достаточно 🤍"
 
 
-# ─────────────────────────────────────────────────────────────
-# /base (открытая команда)
-# ─────────────────────────────────────────────────────────────
-
-def _build_base_message() -> str:
-    lines: List[str] = []
-    lines.append(f"{DIVIDER_ACCENT}\n")
-    lines.append("<b>Справочник отмечаемых компонентов</b>\n")
-    lines.append(f"{DIVIDER_LIGHT}\n")
-
-    lines.append("🔴 <b>Жёсткие комедогенные компоненты</b>")
-    lines.append("Компоненты, которые чаще вызывают комедоны у склонной кожи.\n")
-    for name in sorted(hard_comedogens):
-        lines.append(f"• {name}")
-    lines.append("")
-    lines.append(DIVIDER_LIGHT)
-    lines.append("")
-
-    lines.append("🟠 <b>Условно-комедогенные компоненты</b>")
-    lines.append("Их влияние чаще зависит от индивидуальной реакции кожи и способа использования.\n")
-    for name in sorted(conditional_comedogens.keys()):
-        lines.append(f"• {name}")
-
-    lines.append(f"\n{DIVIDER_ACCENT}")
-    return "\n".join(lines)
-
-
-BASE_MESSAGE = _build_base_message()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1111,11 +1082,6 @@ async def handle_contacts(msg: Message):
     await analytics.track(kind="contacts", user=msg.from_user, chat_id=msg.chat.id)
 
 
-async def handle_base(msg: Message):
-    await msg.answer(BASE_MESSAGE)
-    await analytics.track(kind="base", user=msg.from_user, chat_id=msg.chat.id)
-
-
 async def _answer_from_step1(
     msg: Message,
     data: Dict[str, Any],
@@ -1778,7 +1744,6 @@ async def _main_async():
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_about, Command("about"))
     dp.message.register(handle_contacts, Command("contacts"))
-    dp.message.register(handle_base, Command("base"))
 
     # Скрытые админ-команды — ДО общего текстового хендлера
     admin.register(dp)

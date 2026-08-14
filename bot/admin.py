@@ -23,23 +23,34 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from aiogram import Dispatcher
-from aiogram.filters import BaseFilter, Command
-from aiogram.types import BufferedInputFile, Message
+import hashlib
 
-from . import analytics, config, dashboard
+from aiogram import Dispatcher, F
+from aiogram.filters import BaseFilter, Command
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from . import analytics, comedogen_store, config, dashboard
 
 logger = logging.getLogger(__name__)
 
 TG_LIMIT = 3900  # с запасом до телеграмных 4096
 
 
+def is_admin(user: Any) -> bool:
+    return bool(user and getattr(user, "id", None) in config.ADMIN_IDS)
+
+
 class IsAdmin(BaseFilter):
     """Пропускает только админов; остальным команда «не существует»."""
 
     async def __call__(self, message: Message) -> bool:
-        user = message.from_user
-        return bool(user and user.id in config.ADMIN_IDS)
+        return is_admin(message.from_user)
 
 
 def _e(value: Any) -> str:
@@ -348,6 +359,7 @@ async def cmd_cache_clear(msg: Message) -> None:
 async def cmd_admin_help(msg: Message) -> None:
     await msg.answer(
         "🛠 <b>Скрытые команды</b> (видят только админы)\n\n"
+        "/panel — панель управления с кнопками\n"
         "/stats — сводка: люди, разборы, кэш, ошибки, расход\n"
         "/users — кто чем пользуется\n"
         "/flow [N] — последние N событий (по умолчанию 40)\n"
@@ -355,9 +367,389 @@ async def cmd_admin_help(msg: Message) -> None:
         "/logs [N] — строки лога\n"
         "/export — все события в CSV\n"
         "/dash — ссылка на веб-дашборд\n"
+        "/base — база комедогенов и её правка\n"
         "/cache — состояние кэша, /cache_clear — очистить\n\n"
         f"Админы: <code>{', '.join(str(i) for i in sorted(config.ADMIN_IDS))}</code>"
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Панель: /panel
+# ─────────────────────────────────────────────────────────────
+
+def _panel_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🧪 База комедогенов", callback_data="a:base")],
+        [
+            InlineKeyboardButton(text="📊 Сводка", callback_data="a:stats"),
+            InlineKeyboardButton(text="👥 Люди", callback_data="a:users"),
+        ],
+        [
+            InlineKeyboardButton(text="🌊 Поток", callback_data="a:flow"),
+            InlineKeyboardButton(text="⚠️ Ошибки", callback_data="a:errors"),
+        ],
+        [InlineKeyboardButton(text="🗃 Кэш", callback_data="a:cache")],
+    ]
+    if config.DASHBOARD_ENABLED:
+        rows.insert(
+            1, [InlineKeyboardButton(text="📈 Открыть дашборд", url=dashboard.dashboard_url())]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _panel_text() -> str:
+    st = comedogen_store.stats()
+    lines = [
+        "🛠 <b>Панель управления</b>",
+        "",
+        f"База: 🔴 {st['hard']} жёстких, 🟠 {st['cond']} условных",
+    ]
+    if st["overrides"]:
+        lines.append(f"Правок поверх эталона: {st['overrides']}")
+    lines += ["", "Всё то же есть командами — /adminhelp."]
+    return "\n".join(lines)
+
+
+async def cmd_panel(msg: Message) -> None:
+    await msg.answer(_panel_text(), reply_markup=_panel_keyboard(),
+                     disable_web_page_preview=True)
+    await analytics.track(kind="admin", user=msg.from_user, chat_id=msg.chat.id, detail="/panel")
+
+
+# ─────────────────────────────────────────────────────────────
+# База комедогенов: просмотр и правка
+# ─────────────────────────────────────────────────────────────
+
+# Кого сейчас ждём с текстом названия: {user_id: kind}
+_awaiting_add: Dict[int, str] = {}
+
+PAGE = 10
+
+_KIND_LABEL = {
+    comedogen_store.KIND_HARD: "🔴 Жёсткие",
+    comedogen_store.KIND_COND: "🟠 Условные",
+}
+
+
+def _name_hash(name: str) -> str:
+    """Короткая подпись названия: ловит рассинхрон списка между показом и нажатием."""
+    return hashlib.sha256(comedogen_store.normalize(name).encode()).hexdigest()[:6]
+
+
+def _base_text() -> str:
+    st = comedogen_store.stats()
+    lines = [
+        "🧪 <b>База комедогенов</b>",
+        "",
+        f"Эталон: {st['baseline_hard']} жёстких, {st['baseline_cond']} условных",
+    ]
+    if st["overrides"]:
+        parts = []
+        if st["added"]:
+            parts.append(f"добавлено {st['added']}")
+        if st["dropped"]:
+            parts.append(f"убрано {st['dropped']}")
+        lines.append("Ваши правки: " + ", ".join(parts))
+    else:
+        lines.append("Правок нет — база в эталонном состоянии.")
+    lines += [
+        f"<b>В работе: 🔴 {st['hard']} · 🟠 {st['cond']}</b>",
+        "",
+        "По этой базе код считает риск. Правка меняет вердикты "
+        "для всех пользователей, а кэш готовых разборов сбрасывается.",
+    ]
+    if not comedogen_store.enabled():
+        lines += ["", "⚠️ <i>ANALYTICS_ENABLED=false — правки сохранять некуда, "
+                      "база работает только по эталону.</i>"]
+    return "\n".join(lines)
+
+
+def _base_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🔴 Жёсткие", callback_data="a:list:hard:0"),
+            InlineKeyboardButton(text="🟠 Условные", callback_data="a:list:conditional:0"),
+        ]
+    ]
+    if comedogen_store.enabled():
+        rows.append([InlineKeyboardButton(text="✏️ История правок", callback_data="a:hist")])
+    rows.append([InlineKeyboardButton(text="← В панель", callback_data="a:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _list_text(kind: str, page: int) -> str:
+    items = comedogen_store.listing(kind)
+    total_pages = max(1, (len(items) + PAGE - 1) // PAGE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * PAGE : (page + 1) * PAGE]
+
+    lines = [
+        f"<b>{_KIND_LABEL[kind]} · {len(items)}</b>",
+        f"страница {page + 1} из {total_pages}",
+        "",
+    ]
+    for it in chunk:
+        mark = "" if it["baseline"] else "  ✚ добавлено"
+        lines.append(f"• <code>{_e(it['name'])}</code>{mark}")
+    lines += ["", "Нажми на компонент, чтобы убрать его из базы."]
+    return "\n".join(lines)
+
+
+def _list_keyboard(kind: str, page: int) -> InlineKeyboardMarkup:
+    items = comedogen_store.listing(kind)
+    total_pages = max(1, (len(items) + PAGE - 1) // PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE
+    chunk = items[start : start + PAGE]
+
+    rows = []
+    for offset, it in enumerate(chunk):
+        idx = start + offset
+        rows.append([
+            InlineKeyboardButton(
+                text=f"✕  {it['name']}",
+                callback_data=f"a:rm:{kind}:{idx}:{_name_hash(it['name'])}",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="←", callback_data=f"a:list:{kind}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="→", callback_data=f"a:list:{kind}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    if comedogen_store.enabled():
+        rows.append([InlineKeyboardButton(text="➕ Добавить компонент",
+                                          callback_data=f"a:add:{kind}")])
+    rows.append([InlineKeyboardButton(text="← К базе", callback_data="a:base")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _history_text() -> str:
+    rows = comedogen_store.history(20)
+    if not rows:
+        return "✏️ <b>История правок</b>\n\nПравок ещё не было — база в эталонном состоянии."
+
+    lines = ["✏️ <b>История правок</b>", ""]
+    for r in rows:
+        sign = "＋" if r["action"] == comedogen_store.ACTION_ADD else "−"
+        kind = "жёсткий" if r["kind"] == comedogen_store.KIND_HARD else "условный"
+        state = "" if r["active"] else "  <i>(отменена)</i>"
+        lines.append(
+            f"{sign} <code>{_e(r['name'])}</code> · {kind}{state}\n"
+            f"   {_e(r['author'])}, {_when(r['ts'] or 0)}"
+        )
+    return "\n".join(lines)
+
+
+def _history_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for r in comedogen_store.history(20):
+        if not r["active"]:
+            continue
+        sign = "＋" if r["action"] == comedogen_store.ACTION_ADD else "−"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"↩️ отменить: {sign} {r['name']}"[:60],
+                callback_data=f"a:undo:{r['id']}",
+            )
+        ])
+    if rows:
+        rows.append([InlineKeyboardButton(text="↩️ Сбросить всё к эталону",
+                                          callback_data="a:reset")])
+    rows.append([InlineKeyboardButton(text="← К базе", callback_data="a:base")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def cmd_base(msg: Message) -> None:
+    await msg.answer(_base_text(), reply_markup=_base_keyboard())
+    await analytics.track(kind="admin", user=msg.from_user, chat_id=msg.chat.id, detail="/base")
+
+
+ADD_RESULT = {
+    "added": "✅ <code>{name}</code> добавлен в базу ({kind}).",
+    "restored": "✅ <code>{name}</code> возвращён в базу ({kind}) — прежнее удаление отменено.",
+    "exists": "Компонент <code>{name}</code> уже есть в базе ({kind}).",
+    "empty": "Пустое название.",
+    "bad_kind": "Неизвестный список.",
+}
+
+DROP_RESULT = {
+    "dropped": "✅ <code>{name}</code> убран из базы ({kind}).",
+    "reverted": "✅ <code>{name}</code> убран — это была ваша же правка, теперь отменена.",
+    "missing": "Компонента <code>{name}</code> в базе ({kind}) нет.",
+    "bad_kind": "Неизвестный список.",
+}
+
+
+async def _refresh(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    """Перерисовывает экран на месте; если текст тот же — Telegram ругается, это не ошибка."""
+    try:
+        await cb.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception:  # noqa: BLE001
+        await cb.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def on_callback(cb: CallbackQuery) -> None:
+    """Все кнопки админки. Права проверяются здесь же, а не только на командах."""
+    if not is_admin(cb.from_user):
+        await cb.answer()
+        return
+
+    data = cb.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "panel":
+        await cb.answer()
+        await _refresh(cb, _panel_text(), _panel_keyboard())
+        return
+
+    if action == "base":
+        await cb.answer()
+        _awaiting_add.pop(cb.from_user.id, None)
+        await _refresh(cb, _base_text(), _base_keyboard())
+        return
+
+    if action == "list" and len(parts) >= 4:
+        kind, page = parts[2], int(parts[3] or 0)
+        if kind not in comedogen_store.KINDS:
+            await cb.answer("Неизвестный список.", show_alert=True)
+            return
+        await cb.answer()
+        await _refresh(cb, _list_text(kind, page), _list_keyboard(kind, page))
+        return
+
+    if action == "hist":
+        await cb.answer()
+        await _refresh(cb, _history_text(), _history_keyboard())
+        return
+
+    if action == "add" and len(parts) >= 3:
+        kind = parts[2]
+        if kind not in comedogen_store.KINDS:
+            await cb.answer("Неизвестный список.", show_alert=True)
+            return
+        if not comedogen_store.enabled():
+            await cb.answer("Правки недоступны: ANALYTICS_ENABLED=false.", show_alert=True)
+            return
+        _awaiting_add[cb.from_user.id] = kind
+        await cb.answer()
+        await cb.message.answer(
+            f"Пришли название компонента одним сообщением — добавлю в список "
+            f"«{_KIND_LABEL[kind]}».\n\n"
+            "Пиши как в INCI, латиницей: например <code>isopropyl myristate</code>.\n"
+            "Отмена — /panel"
+        )
+        return
+
+    if action == "rm" and len(parts) >= 5:
+        kind, idx, sig = parts[2], int(parts[3] or 0), parts[4]
+        items = comedogen_store.listing(kind)
+        if idx >= len(items) or _name_hash(items[idx]["name"]) != sig:
+            await cb.answer("Список изменился — открой заново.", show_alert=True)
+            return
+        name = items[idx]["name"]
+        await cb.answer()
+        await cb.message.answer(
+            f"Убрать <code>{_e(name)}</code> из списка «{_KIND_LABEL[kind]}»?\n\n"
+            "Вердикты пересчитаются для всех, кэш разборов сбросится.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✕ Да, убрать",
+                                      callback_data=f"a:rmy:{kind}:{idx}:{sig}")],
+                [InlineKeyboardButton(text="← Отмена", callback_data=f"a:list:{kind}:0")],
+            ]),
+        )
+        return
+
+    if action == "rmy" and len(parts) >= 5:
+        kind, idx, sig = parts[2], int(parts[3] or 0), parts[4]
+        items = comedogen_store.listing(kind)
+        if idx >= len(items) or _name_hash(items[idx]["name"]) != sig:
+            await cb.answer("Список изменился — открой заново.", show_alert=True)
+            return
+        name = items[idx]["name"]
+        code = await comedogen_store.drop(name, kind, cb.from_user)
+        await cb.answer()
+        await cb.message.answer(
+            DROP_RESULT.get(code, "Не получилось.").format(name=_e(name), kind=_KIND_LABEL[kind])
+        )
+        await _log_base_change(cb.from_user, f"drop {kind} {name} → {code}")
+        await cb.message.answer(_base_text(), reply_markup=_base_keyboard())
+        return
+
+    if action == "undo" and len(parts) >= 3:
+        ok = await comedogen_store.undo(int(parts[2] or 0))
+        if ok:
+            await comedogen_store._applied()
+        await cb.answer("Правка отменена." if ok else "Не нашла эту правку.", show_alert=not ok)
+        await _log_base_change(cb.from_user, f"undo {parts[2]} → {ok}")
+        await _refresh(cb, _history_text(), _history_keyboard())
+        return
+
+    if action == "reset":
+        await cb.answer()
+        await cb.message.answer(
+            "Сбросить <b>все</b> правки и вернуть базу к эталону?\n\n"
+            "Сами правки останутся в истории, но перестанут действовать.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Да, к эталону", callback_data="a:resety")],
+                [InlineKeyboardButton(text="← Отмена", callback_data="a:base")],
+            ]),
+        )
+        return
+
+    if action == "resety":
+        n = await comedogen_store.reset()
+        await cb.answer()
+        await cb.message.answer(f"↩️ База возвращена к эталону, отменено правок: {n}.")
+        await _log_base_change(cb.from_user, f"reset → {n}")
+        await cb.message.answer(_base_text(), reply_markup=_base_keyboard())
+        return
+
+    # Кнопки-ярлыки к существующим отчётам
+    shortcut = {
+        "stats": cmd_stats, "users": cmd_users, "flow": cmd_flow,
+        "errors": cmd_errors, "cache": cmd_cache,
+    }.get(action)
+    if shortcut:
+        await cb.answer()
+        await shortcut(cb.message)
+        return
+
+    await cb.answer()
+
+
+async def _log_base_change(user: Any, detail: str) -> None:
+    logger.info("БАЗА: %s (%s)", detail, getattr(user, "id", None))
+    await analytics.track(kind="base_edit", user=user, detail=detail)
+
+
+async def on_add_text(msg: Message) -> None:
+    """Ловит название компонента после нажатия «Добавить»."""
+    kind = _awaiting_add.pop(msg.from_user.id, None)
+    if not kind:
+        return
+    name = (msg.text or "").strip()
+    if len(name) > 40:
+        await msg.answer("Слишком длинное название — до 40 символов.")
+        return
+
+    code = await comedogen_store.add(name, kind, msg.from_user)
+    await msg.answer(
+        ADD_RESULT.get(code, "Не получилось.").format(
+            name=_e(name), kind=_KIND_LABEL.get(kind, kind)
+        )
+    )
+    await _log_base_change(msg.from_user, f"add {kind} {name} → {code}")
+    await msg.answer(_base_text(), reply_markup=_base_keyboard())
+
+
+def waiting_for_name(user: Any) -> bool:
+    """Ждём ли от этого админа название компонента (чтобы не искать его в косметике)."""
+    return getattr(user, "id", None) in _awaiting_add
 
 
 def register(dp: Dispatcher) -> None:
@@ -371,11 +763,18 @@ def register(dp: Dispatcher) -> None:
         (cmd_logs, "logs"),
         (cmd_export, "export"),
         (cmd_dash, "dash"),
+        (cmd_panel, "panel"),
+        (cmd_base, "base"),
         (cmd_cache_clear, "cache_clear"),
         (cmd_cache, "cache"),
         (cmd_admin_help, "adminhelp"),
     ]
     for handler, name in handlers:
         dp.message.register(handler, Command(name), admin)
+
+    # Ввод названия компонента перехватываем раньше обычного текста,
+    # иначе бот примет «isopropyl myristate» за название косметики.
+    dp.message.register(on_add_text, F.text, admin, lambda m: waiting_for_name(m.from_user))
+    dp.callback_query.register(on_callback, F.data.startswith("a:"))
 
     logger.info("Админ-команды включены для id: %s", sorted(config.ADMIN_IDS))

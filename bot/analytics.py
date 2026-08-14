@@ -162,6 +162,21 @@ CREATE TABLE IF NOT EXISTS url_ok (
     ok      INTEGER,
     checked REAL
 );
+
+-- Правки базы комедогенов поверх эталона из agent/comedogen_base.py.
+-- Записи не удаляются: отмена правки — это active = 0, чтобы история
+-- изменений оценки риска сохранялась целиком. Подробности в comedogen_store.py.
+CREATE TABLE IF NOT EXISTS base_overrides (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name      TEXT NOT NULL,
+    kind      TEXT NOT NULL,   -- hard | conditional
+    action    TEXT NOT NULL,   -- add | drop
+    author    TEXT,
+    author_id INTEGER,
+    ts        REAL,
+    active    INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_overrides_active ON base_overrides(active);
 """
 
 
