@@ -40,7 +40,20 @@ command -v docker >/dev/null 2>&1 || die "docker не установлен. По
 # ── Код ──────────────────────────────────────────────────────
 if [ "$PULL" = 1 ]; then
     say "Обновляю код"
+    before=$(git rev-parse HEAD:deploy.sh 2>/dev/null || echo none)
     git pull --ff-only origin main
+    after=$(git rev-parse HEAD:deploy.sh 2>/dev/null || echo none)
+
+    # bash дочитывает скрипт с диска по ходу выполнения и держит открытым
+    # старый файл. Если git подменил deploy.sh, текущий запуск доработает
+    # прежнюю версию — и правки в самом скрипте применятся только со второго
+    # раза. Поэтому перезапускаемся уже новой версией.
+    if [ "$before" != "$after" ]; then
+        say "deploy.sh обновился — перезапускаю новую версию"
+        restart_args="--no-pull"
+        [ "$CHANGE_KEY" = 1 ] && restart_args="$restart_args --key"
+        exec "$0" $restart_args
+    fi
 fi
 echo "Версия: $(git log --oneline -1)"
 

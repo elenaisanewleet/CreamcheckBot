@@ -19,7 +19,7 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import analytics, config
+from . import analytics, comedogen_store, config
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,16 @@ def dashboard_url(host_hint: Optional[str] = None) -> str:
 # Доступ
 # ─────────────────────────────────────────────────────────────
 
+def _same(a: str, b: str) -> bool:
+    """Сравнение за постоянное время, устойчивое к не-ASCII.
+
+    hmac.compare_digest со строками принимает только ASCII и падает
+    TypeError на кириллице — а пароль вполне могут придумать по-русски,
+    и тогда дашборд отвечал бы 500 на каждый запрос.
+    """
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 def _authorized(request: web.Request) -> bool:
     supplied = request.query.get("key") or ""
     if not supplied:
@@ -45,7 +55,7 @@ def _authorized(request: web.Request) -> bool:
             supplied = auth[7:].strip()
     if not supplied:
         supplied = request.cookies.get("cc_key", "")
-    return hmac.compare_digest(supplied, DASHBOARD_TOKEN)
+    return _same(supplied, DASHBOARD_TOKEN)
 
 
 def _guard(handler):
@@ -90,6 +100,99 @@ async def api_logs(request: web.Request) -> web.Response:
         limit = 300
     return web.json_response({"lines": analytics.recent_logs(limit)},
                              dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
+# ─────────────────────────────────────────────────────────────
+# База комедогенов: просмотр и правка
+# ─────────────────────────────────────────────────────────────
+
+class _WebEditor:
+    """Автор правки, сделанной через дашборд.
+
+    В истории важно отличать её от правки из Telegram: там автор известен
+    поимённо, а здесь — только то, что кто-то знал ключ.
+    """
+
+    id = None
+    username = None
+    full_name = "веб-дашборд"
+
+
+def _authorized_write(request: web.Request) -> bool:
+    """Для правки ключ обязан прийти явно, а не из cookie.
+
+    Cookie браузер отправляет сам, поэтому чужая страница могла бы отправить
+    форму на наш адрес и поменять базу от имени залогиненного человека.
+    Заголовок X-CC-Key чужой сайт выставить не может — на это и опираемся.
+    """
+    supplied = request.headers.get("X-CC-Key", "") or request.query.get("key", "")
+    return bool(supplied) and _same(supplied, DASHBOARD_TOKEN)
+
+
+@_guard
+async def api_base(request: web.Request) -> web.Response:
+    """Текущая база: что в работе, что правили и кем."""
+    return web.json_response(
+        {
+            "stats": comedogen_store.stats(),
+            "hard": comedogen_store.listing(comedogen_store.KIND_HARD),
+            "cond": comedogen_store.listing(comedogen_store.KIND_COND),
+            "history": comedogen_store.history(30),
+            "editable": comedogen_store.enabled(),
+        },
+        dumps=lambda o: json.dumps(o, ensure_ascii=False),
+    )
+
+
+@_guard
+async def api_base_edit(request: web.Request) -> web.Response:
+    if not _authorized_write(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    if not comedogen_store.enabled():
+        return web.json_response(
+            {"error": "База данных выключена (ANALYTICS_ENABLED=false), правки хранить негде."},
+            status=409,
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "Ожидался JSON."}, status=400)
+
+    action = str(payload.get("action") or "")
+    name = str(payload.get("name") or "").strip()
+    kind = str(payload.get("kind") or "")
+
+    if action in ("add", "drop"):
+        if kind not in comedogen_store.KINDS:
+            return web.json_response({"error": "Неизвестный список."}, status=400)
+        if not name:
+            return web.json_response({"error": "Пустое название."}, status=400)
+        if len(name) > 40:
+            return web.json_response({"error": "Слишком длинное название (до 40 символов)."},
+                                     status=400)
+        fn = comedogen_store.add if action == "add" else comedogen_store.drop
+        code = await fn(name, kind, _WebEditor())
+    elif action == "undo":
+        try:
+            ok = await comedogen_store.undo(int(payload.get("id") or 0))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "Не та правка."}, status=400)
+        if ok:
+            await comedogen_store._applied()
+        code = "undone" if ok else "missing"
+    elif action == "reset":
+        code = f"reset:{await comedogen_store.reset()}"
+    else:
+        return web.json_response({"error": "Неизвестное действие."}, status=400)
+
+    logger.info("БАЗА (дашборд): %s %s %s → %s", action, kind, name, code)
+    await analytics.track(kind="base_edit", detail=f"web {action} {kind} {name} → {code}")
+
+    return web.json_response(
+        {"result": code, "stats": comedogen_store.stats()},
+        dumps=lambda o: json.dumps(o, ensure_ascii=False),
+    )
 
 
 @_guard
@@ -166,6 +269,14 @@ th{ text-align:left;color:var(--muted);font-weight:600;font-size:11.5px;text-tra
 td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
 tr:last-child td{border-bottom:0}
 .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.chip{font:inherit;font-size:12.5px;padding:5px 11px;border-radius:999px;cursor:pointer;
+  background:var(--card);border:1px solid var(--line);color:inherit}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.addrow{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.addrow input{font:inherit;font-size:13px;padding:6px 11px;border-radius:999px;flex:1;min-width:180px;
+  background:var(--card);border:1px solid var(--line);color:inherit}
+.addrow input:focus{outline:none;border-color:var(--accent)}
 .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--bg);border:1px solid var(--line)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
@@ -194,7 +305,9 @@ a{color:var(--accent)}
   </div>
 </header>
 <div id="app">Загружаю…</div>
-<div class="foot">Обновляется автоматически раз в 30 секунд. Данные хранятся локально на сервере бота.</div>
+<div id="base"></div>
+<div class="foot">Статистика обновляется сама раз в 30 секунд. База комедогенов — только по действию,
+чтобы не сбрасывать набранное. Данные хранятся локально на сервере бота.</div>
 </div>
 <script>
 const KEY = new URLSearchParams(location.search).get('key') || '';
@@ -343,7 +456,117 @@ async function load(){
       if (el) el.textContent = (d.lines||[]).join('\\n') || 'Лог пока пуст.'; }
   }catch(e){ console.error(e); }
 }
+
+// ── База комедогенов ─────────────────────────────────────────
+// Живёт вне #app: статистика перерисовывается раз в 30 секунд, и если бы
+// база была внутри, у человека пропадал бы набранный в поле текст.
+
+function chips(items, kind){
+  if (!items.length) return '<div class="sub">пусто</div>';
+  return items.map(i => {
+    const own = i.baseline ? '' : ' ✚';
+    return `<button class="chip" title="Убрать из базы"
+      onclick="baseDrop('${kind}', ${JSON.stringify(i.name)})">✕ ${esc(i.name)}${own}</button>`;
+  }).join(' ');
+}
+
+function historyRows(rows){
+  if (!rows.length) return '<div class="sub">правок не было — база в эталонном состоянии</div>';
+  return rows.map(r => {
+    const sign = r.action === 'add' ? '＋' : '−';
+    const kind = r.kind === 'hard' ? 'жёсткий' : 'условный';
+    const undo = r.active
+      ? `<button class="chip" onclick="baseUndo(${r.id})">↩️ отменить</button>`
+      : '<span class="sub">отменена</span>';
+    return `<tr><td>${sign} <code>${esc(r.name)}</code></td><td>${kind}</td>
+      <td>${esc(r.author || '—')}</td><td class="mono">${when(r.ts)}</td><td>${undo}</td></tr>`;
+  }).join('');
+}
+
+function renderBase(b){
+  const s = b.stats;
+  const ro = b.editable ? '' :
+    '<div class="card">⚠️ ANALYTICS_ENABLED=false — правки хранить негде, база только для просмотра.</div>';
+  document.getElementById('base').innerHTML = `
+  <h2>База комедогенов</h2>
+  ${ro}
+  <div class="card">
+    <div class="k">По этой базе код считает риск. Правка меняет вердикты для всех
+    пользователей, кэш готовых разборов сбрасывается автоматически.</div>
+    <div class="v">🔴 ${s.hard} · 🟠 ${s.cond}
+      <small>эталон ${s.baseline_hard}/${s.baseline_cond}${
+        s.overrides ? `, ваших правок ${s.overrides}` : ', правок нет'}</small></div>
+  </div>
+
+  <div class="card">
+    <div class="k">🔴 Жёсткие комедогены · ${b.hard.length}</div>
+    <div class="chips">${chips(b.hard, 'hard')}</div>
+    <div class="addrow">
+      <input id="add-hard" placeholder="isopropyl myristate" maxlength="40">
+      <button class="chip" onclick="baseAdd('hard')">➕ Добавить</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="k">🟠 Условно-комедогенные · ${b.cond.length}</div>
+    <div class="chips">${chips(b.cond, 'conditional')}</div>
+    <div class="addrow">
+      <input id="add-conditional" placeholder="jojoba oil" maxlength="40">
+      <button class="chip" onclick="baseAdd('conditional')">➕ Добавить</button>
+    </div>
+  </div>
+
+  <div class="card scroll">
+    <div class="k">История правок</div>
+    <table><tbody>${historyRows(b.history || [])}</tbody></table>
+    ${s.overrides ? '<div class="addrow"><button class="chip" onclick="baseReset()">' +
+      '↩️ Сбросить всё к эталону</button></div>' : ''}
+  </div>`;
+}
+
+async function loadBase(){
+  try{
+    const r = await fetch('/api/base?key=' + encodeURIComponent(KEY));
+    if (!r.ok) return;
+    renderBase(await r.json());
+  }catch(e){ console.error(e); }
+}
+
+async function baseSend(body){
+  try{
+    const r = await fetch('/api/base?key=' + encodeURIComponent(KEY), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-CC-Key': KEY},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok){ alert(d.error || 'Не получилось.'); return false; }
+    await loadBase();
+    return true;
+  }catch(e){ alert('Сеть недоступна.'); return false; }
+}
+
+function baseAdd(kind){
+  const el = document.getElementById('add-' + kind);
+  const name = (el.value || '').trim();
+  if (!name) { el.focus(); return; }
+  baseSend({action:'add', kind, name}).then(ok => { if (ok) el.value = ''; });
+}
+
+function baseDrop(kind, name){
+  if (!confirm('Убрать «' + name + '» из базы?\\n\\nВердикты пересчитаются для всех, кэш сбросится.')) return;
+  baseSend({action:'drop', kind, name});
+}
+
+function baseUndo(id){ baseSend({action:'undo', id}); }
+
+function baseReset(){
+  if (!confirm('Сбросить все правки и вернуть базу к эталону?')) return;
+  baseSend({action:'reset'});
+}
+
 load();
+loadBase();
 setInterval(load, 30000);
 </script></body></html>
 """
@@ -388,6 +611,8 @@ async def build_app() -> web.Application:
         app.router.add_get("/api/events", api_events)
         app.router.add_get("/api/logs", api_logs)
         app.router.add_get("/export.csv", export_csv)
+        app.router.add_get("/api/base", api_base)
+        app.router.add_post("/api/base", api_base_edit)
 
     return app
 
