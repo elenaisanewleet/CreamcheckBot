@@ -82,15 +82,20 @@ for required in TELEGRAM_BOT_TOKEN OPENAI_API_KEY; do
 done
 if ! grep -qE '^DASHBOARD_TOKEN=.+' .env; then
     warn "DASHBOARD_TOKEN пуст — он сгенерируется при старте и будет меняться при каждом перезапуске."
-elif grep -qiE '^DASHBOARD_TOKEN=(придумай|введи|заполни|change|your|secret|password|token|test)' .env \
-     || grep -qE '^DASHBOARD_TOKEN=.{,15}$' .env; then
+elif grep -qiE '^DASHBOARD_TOKEN=(придумай|введи|заполни|change-?me|your-?|secret|password|token|test)' .env; then
     # Заглушку из инструкции легко вставить дословно, а «непустой» у неё выполняется.
-    # Дашборд смотрит в интернет, и слабый ключ здесь — это открытая статистика.
-    die "DASHBOARD_TOKEN похож на заглушку или слишком короткий. Задай стойкий:
+    die "DASHBOARD_TOKEN — это заглушка из инструкции, а не пароль. Задай свой:
     NEW=\$(openssl rand -hex 24)
     grep -v '^DASHBOARD_TOKEN=' .env > .env.tmp && mv .env.tmp .env
     printf 'DASHBOARD_TOKEN=%s\\n' \"\$NEW\" >> .env
     echo \"http://<адрес>:${PORT}/dash?key=\$NEW\"; unset NEW"
+elif [ "$(grep '^DASHBOARD_TOKEN=' .env | cut -d= -f2- | tr -d '\n' | wc -c)" -lt 16 ]; then
+    # Короткий пароль — плохо, но это не повод не выкатывать бота.
+    # Предупреждаем громко и продолжаем.
+    warn "DASHBOARD_TOKEN короче 16 символов. Дашборд открыт в интернет,"
+    warn "такой пароль подбирается. Стойкий: openssl rand -hex 24"
+    warn "Деплой продолжаю — бот важнее."
+    sleep 3
 fi
 
 # ── Сборка ───────────────────────────────────────────────────
