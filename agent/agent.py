@@ -724,6 +724,27 @@ _SRC_VALUES = (SRC_WEB, SRC_KNOWN, SRC_THIN)
 
 _FIELD_RE = re.compile(r"\|\s*(grp|src|note|ask)\s*=", re.I)
 
+# Модель с включённым веб-поиском дописывает к тексту сноски вида
+# «([pubmed.ncbi.nlm.nih.gov](https://pubmed.../?utm_source=openai))».
+# Запрета в промпте недостаточно — вычищаем кодом, иначе человек видит мусор.
+_MD_LINK = re.compile(r"\s*\(?\[[^\]\n]*\]\(\s*https?://[^)\s]*\s*\)\)?")
+# Адрес забираем целиком до пробела, но не проглатываем точку в конце
+# предложения: последний символ ссылки должен быть «содержательным».
+_BARE_URL = re.compile(r"\s*\(?\s*https?://[^\s)]*[\w/=&%-]\)?")
+_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,;:!?])")
+
+
+def _strip_citations(text: str) -> str:
+    """Убирает markdown-сноски и голые ссылки из текста для пользователя."""
+    if not text:
+        return ""
+    t = _MD_LINK.sub("", text)
+    t = _BARE_URL.sub("", t)
+    t = _SPACE_BEFORE_PUNCT.sub(r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    # После вырезания сноски в конце могла остаться висячая пунктуация.
+    return t.rstrip(" ,;:—-").strip()
+
 
 def _parse_ingredients_marked_text(text: str) -> Dict[int, Dict[str, str]]:
     """Разбирает `- 7 | grp=emol | src=web | note=… | ask=…` в {номер: поля}.
@@ -759,8 +780,8 @@ def _parse_ingredients_marked_text(text: str) -> Dict[int, Dict[str, str]]:
         out[num] = {
             "grp": normalize_group(fields.get("grp", FALLBACK_GROUP)),
             "src": src if src in _SRC_VALUES else "",
-            "note": fields.get("note", ""),
-            "ask": fields.get("ask", ""),
+            "note": _strip_citations(fields.get("note", "")),
+            "ask": _strip_citations(fields.get("ask", "")),
         }
     return out
 
@@ -839,9 +860,26 @@ async def run_agent_ingredients_ex(step1_payload: Dict[str, Any]) -> AgentResult
     usage.merge(u)
 
     parsed = _parse_ingredients_marked_text((resp.output_text or "").strip())
+
+    # Открытые вопросы врачу — то, ради чего этот шаг и нужен. Если модель
+    # их не заполнила, экраны выглядят готовыми, а кнопки «вопросы по группе»
+    # молча не появляются. Раньше это было видно только ручным прогоном.
+    asks = sum(1 for v in parsed.values() if v.get("ask"))
+    flagged = [it["n"] for it in payload["items"] if it.get("mark")]
+    flagged_without_ask = [n for n in flagged if not (parsed.get(n) or {}).get("ask")]
+
     logger.info(
-        "INGREDIENTS: разобрано %d из %d компонентов", len(parsed), len(payload["items"])
+        "INGREDIENTS: разобрано %d из %d компонентов, вопросов врачу %d",
+        len(parsed), len(payload["items"]), asks,
     )
+    if flagged_without_ask:
+        logger.warning(
+            "INGREDIENTS: у отмеченных компонентов нет вопроса врачу (позиции %s) — "
+            "модель не выполнила обязательную часть промпта",
+            ", ".join(str(n) for n in flagged_without_ask),
+        )
+    elif not asks and payload["items"]:
+        logger.warning("INGREDIENTS: ни одного вопроса врачу на весь состав")
 
     assembled = _assemble_groups(payload, parsed)
     return AgentResult(raw=json.dumps(assembled, ensure_ascii=False), usage=usage)
