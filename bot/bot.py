@@ -1443,7 +1443,12 @@ async def handle_photo(msg: Message, bot: Bot):
     t0 = time.monotonic()
     # Плашку «Анализирую фото» показываем СРАЗУ, параллельно со скачиванием —
     # человек видит реакцию бота на ~секунду раньше.
-    status_task = asyncio.create_task(msg.answer(PROCESSING_PHOTO))
+    #
+    # ensure_future, а не create_task: msg.answer() в aiogram 3 возвращает
+    # объект SendMessage — он awaitable, но не корутина, и create_task
+    # падает на нём TypeError. Обработчик умирал на первой строке, до любой
+    # отправки, поэтому на фото бот просто молчал.
+    status_task = asyncio.ensure_future(msg.answer(PROCESSING_PHOTO))
     try:
         images = await _collect_images(bot, [msg.photo[-1]])
     except Exception as e:  # noqa: BLE001
