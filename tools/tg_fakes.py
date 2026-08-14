@@ -171,12 +171,21 @@ class FakeMessage:
         self.from_user = user or FakeUser()
         self.chat = chat or FakeChat()
         self.sent: List[SendMessage] = []
+        # Правка на месте — тоже показанный экран, но список свой:
+        # админка рисует ею, обычные экраны — нет.
+        self.edits: List[SendMessage] = []
         # Телеграм умеет отказать в отправке: чат закрыт, флуд-контроль, таймаут.
         self.answer_error = answer_error
+        self.edit_error: Optional[BaseException] = None
 
     def answer(self, text: str, reply_markup: Any = None, **kwargs: Any) -> SendMessage:
         return SendMessage(
             self.sent, text, reply_markup, chat=self.chat, error=self.answer_error, **kwargs
+        )
+
+    def edit_text(self, text: str, reply_markup: Any = None, **kwargs: Any) -> SendMessage:
+        return SendMessage(
+            self.edits, text, reply_markup, chat=self.chat, error=self.edit_error, **kwargs
         )
 
     def delete(self) -> DeleteMessage:
@@ -233,6 +242,11 @@ def texts(target: Any) -> List[str]:
     """Тексты всего, что реально ушло человеку."""
     sink = getattr(target, "sent", target)
     return [m.text for m in sink]
+
+
+def screens(message: Any) -> List[SendMessage]:
+    """Всё, что человек увидел: и новые сообщения, и правки на месте."""
+    return list(getattr(message, "sent", [])) + list(getattr(message, "edits", []))
 
 
 def buttons(markup: Any) -> List[Tuple[str, Optional[str]]]:

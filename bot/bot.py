@@ -15,7 +15,6 @@ ComedoBot — Telegram bot (aiogram 3) — FINAL BALANCED VERSION
 """
 
 import asyncio
-import functools
 import hashlib
 import html
 import json
@@ -38,6 +37,7 @@ from aiogram.types import (
 )
 
 from . import admin, analytics, config, dashboard
+from .tg import never_silent, quiet
 from .config import TELEGRAM_BOT_TOKEN
 from agent.agent import (
     build_ingredients_payload,
@@ -1525,49 +1525,7 @@ async def handle_text(msg: Message, bot: Bot):
 # Кнопки
 # ─────────────────────────────────────────────────────────────
 
-async def _quiet(request: Any) -> Any:
-    """Служебная отправка, сбой которой не должен отменять ответ по существу.
-
-    Часики на кнопке и плашка «разбираю» — украшение. Telegram отказывает в них
-    штатно: «query is too old», флуд-контроль, закрытый чат. Раньше такой отказ
-    уносил весь обработчик, и человек оставался без экрана из-за погасшей
-    анимации.
-    """
-    try:
-        return await request
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Telegram отказал в служебном сообщении: %s", exc)
-        return None
-
-
-def _never_silent(handler):
-    """Гарантирует, что нажатие кнопки закончится словами, а не тишиной.
-
-    aiogram уносит исключение обработчика в лог и живёт дальше — для человека
-    это выглядит как «нажал и ничего». Тот же класс, что молчание на фото:
-    разбор исправен, а экран не пришёл. Поэтому любое падение превращаем
-    в честное сообщение об ошибке.
-    """
-
-    @functools.wraps(handler)
-    async def wrapper(cb: CallbackQuery, *args: Any, **kwargs: Any):
-        try:
-            return await handler(cb, *args, **kwargs)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("CALLBACK ERROR %s: %s", handler.__name__, exc, exc_info=True)
-            await _quiet(cb.answer())
-            chat_id = cb.message.chat.id if cb.message is not None else None
-            if cb.message is not None:
-                await _quiet(cb.message.answer(ERROR_GENERAL))
-            await analytics.track(
-                kind="callback", user=cb.from_user, chat_id=chat_id, status="error",
-                detail=f"{handler.__name__}: {type(exc).__name__}: {exc}",
-            )
-
-    return wrapper
-
-
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_composition_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("composition:"):
@@ -1579,7 +1537,7 @@ async def handle_composition_callback(cb: CallbackQuery):
         await cb.answer("Эта кнопка уже неактуальна. Отправь запрос заново.", show_alert=True)
         return
 
-    await _quiet(cb.answer())
+    await quiet(cb.answer())
 
     t0 = time.monotonic()
     # Ссылку-источник проверяем здесь (обычно уже прогрета в фоне и это мгновенно)
@@ -1679,7 +1637,7 @@ async def _run_step2_background(
         STEP2_INFLIGHT.pop(token, None)
 
 
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
     payload = cb.data or ""
     if not payload.startswith("step2:"):
@@ -1699,8 +1657,8 @@ async def handle_step2_callback(cb: CallbackQuery, bot: Bot):
     # до конца жизни токена отвечает «Уже формирую ответ» и не присылает ничего.
     STEP2_INFLIGHT[token] = time.time()
     try:
-        await _quiet(cb.answer())
-        await _quiet(cb.message.answer(PROCESSING_STEP2))
+        await quiet(cb.answer())
+        await quiet(cb.message.answer(PROCESSING_STEP2))
         chat_id = cb.message.chat.id
         asyncio.create_task(_run_step2_background(bot, chat_id, step1_data, token, cb.from_user))
     except BaseException:
@@ -1774,7 +1732,7 @@ async def _load_ingredients(
     return data
 
 
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_groups_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("groups:"):
@@ -1800,9 +1758,9 @@ async def handle_groups_callback(cb: CallbackQuery):
         INGREDIENTS_INFLIGHT[token] = time.time()
 
     try:
-        await _quiet(cb.answer())
+        await quiet(cb.answer())
         if not ready:
-            await _quiet(cb.message.answer(PROCESSING_INGREDIENTS))
+            await quiet(cb.message.answer(PROCESSING_INGREDIENTS))
         data = await _load_ingredients(
             step1_data, token, user=cb.from_user, chat_id=cb.message.chat.id
         )
@@ -1824,7 +1782,7 @@ async def handle_groups_callback(cb: CallbackQuery):
     )
 
 
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_group_card_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("grp:"):
@@ -1849,7 +1807,7 @@ async def handle_group_card_callback(cb: CallbackQuery):
         await cb.answer("Такой группы в этом составе нет.", show_alert=True)
         return
 
-    await _quiet(cb.answer())
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_group_card_message(step1_data, group),
@@ -1863,7 +1821,7 @@ async def handle_group_card_callback(cb: CallbackQuery):
     )
 
 
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_group_questions_callback(cb: CallbackQuery):
     """Вопросы врачу по одной группе — из пометок ask у её компонентов."""
     payload = cb.data or ""
@@ -1889,7 +1847,7 @@ async def handle_group_questions_callback(cb: CallbackQuery):
         await cb.answer("По этой группе вопросов не набралось.", show_alert=True)
         return
 
-    await _quiet(cb.answer())
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_group_questions_message(step1_data, group),
@@ -1901,7 +1859,7 @@ async def handle_group_questions_callback(cb: CallbackQuery):
     )
 
 
-@_never_silent
+@never_silent(ERROR_GENERAL)
 async def handle_doctor_callback(cb: CallbackQuery):
     payload = cb.data or ""
     if not payload.startswith("doc:"):
@@ -1914,7 +1872,7 @@ async def handle_doctor_callback(cb: CallbackQuery):
         await cb.answer(STALE_BUTTON, show_alert=True)
         return
 
-    await _quiet(cb.answer())
+    await quiet(cb.answer())
     await _answer_long(
         cb.message,
         build_doctor_questions_message(step1_data, questions),

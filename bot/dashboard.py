@@ -178,8 +178,6 @@ async def api_base_edit(request: web.Request) -> web.Response:
             ok = await comedogen_store.undo(int(payload.get("id") or 0))
         except (TypeError, ValueError):
             return web.json_response({"error": "Не та правка."}, status=400)
-        if ok:
-            await comedogen_store._applied()
         code = "undone" if ok else "missing"
     elif action == "reset":
         code = f"reset:{await comedogen_store.reset()}"

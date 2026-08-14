@@ -36,6 +36,7 @@ from aiogram.types import (
 )
 
 from . import analytics, comedogen_store, config, dashboard
+from .tg import never_silent, quiet
 
 logger = logging.getLogger(__name__)
 
@@ -592,10 +593,21 @@ async def _refresh(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -
         await cb.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
 
 
+ADMIN_ERROR = "Не получилось выполнить действие — подробности в /logs."
+
+
+@never_silent(ADMIN_ERROR)
 async def on_callback(cb: CallbackQuery) -> None:
-    """Все кнопки админки. Права проверяются здесь же, а не только на командах."""
+    """Все кнопки админки. Права проверяются здесь же, а не только на командах.
+
+    Гарантия «ответ вместо тишины» здесь та же, что на обычных экранах:
+    упавшая кнопка админки так же выглядит как «нажал и ничего».
+    """
+    # Чужому команда «не существует»: гасим часики и молчим. quiet() здесь
+    # обязателен — иначе сбой ответа увёл бы нас в общий обработчик ошибок,
+    # и посторонний узнал бы, что панель существует.
     if not is_admin(cb.from_user):
-        await cb.answer()
+        await quiet(cb.answer())
         return
 
     data = cb.data or ""
@@ -603,12 +615,12 @@ async def on_callback(cb: CallbackQuery) -> None:
     action = parts[1] if len(parts) > 1 else ""
 
     if action == "panel":
-        await cb.answer()
+        await quiet(cb.answer())
         await _refresh(cb, _panel_text(), _panel_keyboard())
         return
 
     if action == "base":
-        await cb.answer()
+        await quiet(cb.answer())
         _awaiting_add.pop(cb.from_user.id, None)
         await _refresh(cb, _base_text(), _base_keyboard())
         return
@@ -618,12 +630,12 @@ async def on_callback(cb: CallbackQuery) -> None:
         if kind not in comedogen_store.KINDS:
             await cb.answer("Неизвестный список.", show_alert=True)
             return
-        await cb.answer()
+        await quiet(cb.answer())
         await _refresh(cb, _list_text(kind, page), _list_keyboard(kind, page))
         return
 
     if action == "hist":
-        await cb.answer()
+        await quiet(cb.answer())
         await _refresh(cb, _history_text(), _history_keyboard())
         return
 
@@ -636,7 +648,7 @@ async def on_callback(cb: CallbackQuery) -> None:
             await cb.answer("Правки недоступны: ANALYTICS_ENABLED=false.", show_alert=True)
             return
         _awaiting_add[cb.from_user.id] = kind
-        await cb.answer()
+        await quiet(cb.answer())
         await cb.message.answer(
             f"Пришли название компонента одним сообщением — добавлю в список "
             f"«{_KIND_LABEL[kind]}».\n\n"
@@ -652,7 +664,7 @@ async def on_callback(cb: CallbackQuery) -> None:
             await cb.answer("Список изменился — открой заново.", show_alert=True)
             return
         name = items[idx]["name"]
-        await cb.answer()
+        await quiet(cb.answer())
         await cb.message.answer(
             f"Убрать <code>{_e(name)}</code> из списка «{_KIND_LABEL[kind]}»?\n\n"
             "Вердикты пересчитаются для всех, кэш разборов сбросится.",
@@ -672,7 +684,7 @@ async def on_callback(cb: CallbackQuery) -> None:
             return
         name = items[idx]["name"]
         code = await comedogen_store.drop(name, kind, cb.from_user)
-        await cb.answer()
+        await quiet(cb.answer())
         await cb.message.answer(
             DROP_RESULT.get(code, "Не получилось.").format(name=_e(name), kind=_KIND_LABEL[kind])
         )
@@ -682,15 +694,13 @@ async def on_callback(cb: CallbackQuery) -> None:
 
     if action == "undo" and len(parts) >= 3:
         ok = await comedogen_store.undo(int(parts[2] or 0))
-        if ok:
-            await comedogen_store._applied()
         await cb.answer("Правка отменена." if ok else "Не нашла эту правку.", show_alert=not ok)
         await _log_base_change(cb.from_user, f"undo {parts[2]} → {ok}")
         await _refresh(cb, _history_text(), _history_keyboard())
         return
 
     if action == "reset":
-        await cb.answer()
+        await quiet(cb.answer())
         await cb.message.answer(
             "Сбросить <b>все</b> правки и вернуть базу к эталону?\n\n"
             "Сами правки останутся в истории, но перестанут действовать.",
@@ -703,7 +713,7 @@ async def on_callback(cb: CallbackQuery) -> None:
 
     if action == "resety":
         n = await comedogen_store.reset()
-        await cb.answer()
+        await quiet(cb.answer())
         await cb.message.answer(f"↩️ База возвращена к эталону, отменено правок: {n}.")
         await _log_base_change(cb.from_user, f"reset → {n}")
         await cb.message.answer(_base_text(), reply_markup=_base_keyboard())
@@ -715,11 +725,11 @@ async def on_callback(cb: CallbackQuery) -> None:
         "errors": cmd_errors, "cache": cmd_cache,
     }.get(action)
     if shortcut:
-        await cb.answer()
+        await quiet(cb.answer())
         await shortcut(cb.message)
         return
 
-    await cb.answer()
+    await quiet(cb.answer())
 
 
 async def _log_base_change(user: Any, detail: str) -> None:
